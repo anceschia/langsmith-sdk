@@ -1,19 +1,15 @@
-import pRetry from "p-retry";
-import PQueueMod from "p-queue";
+import pRetry from "../utils/p-retry/index.js";
+import { PQueue, PQueueType } from "./p-queue.js";
 import { _getFetchImplementation } from "../singletons/fetch.js";
 
-const STATUS_NO_RETRY = [
-  400, // Bad Request
-  401, // Unauthorized
-  403, // Forbidden
-  404, // Not Found
-  405, // Method Not Allowed
-  406, // Not Acceptable
-  407, // Proxy Authentication Required
+const STATUS_RETRYABLE = [
   408, // Request Timeout
-];
-const STATUS_IGNORE = [
-  409, // Conflict
+  425, // Too Early
+  429, // Too Many Requests
+  500, // Internal Server Error
+  502, // Bad Gateway
+  503, // Service Unavailable
+  504, // Gateway Timeout
 ];
 
 type ResponseCallback = (response?: Response) => Promise<boolean>;
@@ -29,6 +25,12 @@ export interface AsyncCallerParams {
    * with an exponential backoff between each attempt. Defaults to 6.
    */
   maxRetries?: number;
+  /**
+   * The maximum size of the queue buffer in bytes. When the queue reaches this size,
+   * new calls will be dropped instead of queued.
+   * If not specified, no limit is enforced.
+   */
+  maxQueueSizeBytes?: number;
 
   onFailedResponseHook?: ResponseCallback;
 
@@ -37,6 +39,11 @@ export interface AsyncCallerParams {
 
 export interface AsyncCallerCallOptions {
   signal?: AbortSignal;
+  /**
+   * The size of this call in bytes, used for queue size tracking.
+   * If not provided, size tracking is skipped for this call.
+   */
+  sizeBytes?: number;
 }
 
 /**
@@ -57,26 +64,20 @@ export class AsyncCaller {
 
   protected maxRetries: AsyncCallerParams["maxRetries"];
 
-  queue: typeof import("p-queue")["default"]["prototype"];
+  protected maxQueueSizeBytes: AsyncCallerParams["maxQueueSizeBytes"];
+
+  queue: PQueueType;
 
   private onFailedResponseHook?: ResponseCallback;
 
-  private debug?: boolean;
+  private queueSizeBytes = 0;
 
   constructor(params: AsyncCallerParams) {
     this.maxConcurrency = params.maxConcurrency ?? Infinity;
     this.maxRetries = params.maxRetries ?? 6;
-    this.debug = params.debug;
+    this.maxQueueSizeBytes = params.maxQueueSizeBytes;
 
-    if ("default" in PQueueMod) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      this.queue = new (PQueueMod.default as any)({
-        concurrency: this.maxConcurrency,
-      });
-    } else {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      this.queue = new (PQueueMod as any)({ concurrency: this.maxConcurrency });
-    }
+    this.queue = new PQueue({ concurrency: this.maxConcurrency });
     this.onFailedResponseHook = params?.onFailedResponseHook;
   }
 
@@ -85,8 +86,38 @@ export class AsyncCaller {
     callable: T,
     ...args: Parameters<T>
   ): Promise<Awaited<ReturnType<T>>> {
+    return this.callWithOptions({}, callable, ...args);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callWithOptions<A extends any[], T extends (...args: A) => Promise<any>>(
+    options: AsyncCallerCallOptions,
+    callable: T,
+    ...args: Parameters<T>
+  ): Promise<Awaited<ReturnType<T>>> {
+    const sizeBytes = options.sizeBytes ?? 0;
+
+    // Check if adding this call would exceed the byte size limit
+    if (
+      this.maxQueueSizeBytes !== undefined &&
+      sizeBytes > 0 &&
+      this.queueSizeBytes + sizeBytes > this.maxQueueSizeBytes
+    ) {
+      return Promise.reject(
+        new Error(
+          `Queue size limit (${this.maxQueueSizeBytes} bytes) exceeded. ` +
+            `Current queue size: ${this.queueSizeBytes} bytes, attempted addition: ${sizeBytes} bytes.`
+        )
+      );
+    }
+
+    // Add to queue size tracking
+    if (sizeBytes > 0) {
+      this.queueSizeBytes += sizeBytes;
+    }
+
     const onFailedResponseHook = this.onFailedResponseHook;
-    return this.queue.add(
+    let promise = this.queue.add(
       () =>
         pRetry(
           () =>
@@ -99,53 +130,71 @@ export class AsyncCaller {
               }
             }),
           {
-            async onFailedAttempt(error) {
+            async onFailedAttempt({ error }: { error: unknown }) {
+              // Rethrow the value if it's not an object
+              if (typeof error !== "object" || error == null) throw error;
+
+              const errorMessage =
+                "message" in error && typeof error.message === "string"
+                  ? error.message
+                  : undefined;
+
               if (
-                error.message.startsWith("Cancel") ||
-                error.message.startsWith("TimeoutError") ||
-                error.message.startsWith("AbortError")
+                errorMessage?.startsWith("Cancel") ||
+                errorMessage?.startsWith("TimeoutError") ||
+                errorMessage?.startsWith("AbortError")
               ) {
                 throw error;
               }
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              if ((error as any)?.code === "ECONNABORTED") {
+
+              if ("name" in error && error.name === "TimeoutError") {
                 throw error;
               }
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              const response: Response | undefined = (error as any)?.response;
-              const status = response?.status;
-              if (status) {
-                if (STATUS_NO_RETRY.includes(+status)) {
-                  throw error;
-                } else if (STATUS_IGNORE.includes(+status)) {
-                  return;
-                }
-                if (onFailedResponseHook) {
-                  await onFailedResponseHook(response);
-                }
+
+              if ("code" in error && error.code === "ECONNABORTED") {
+                throw error;
+              }
+
+              const response =
+                "response" in error
+                  ? (error.response as Response | undefined)
+                  : undefined;
+
+              if (onFailedResponseHook) {
+                const handled = await onFailedResponseHook(response);
+                if (handled) return;
+              }
+
+              const status =
+                response?.status ??
+                ("status" in error ? error.status : undefined);
+
+              if (
+                status != null &&
+                (typeof status === "number" || typeof status === "string") &&
+                !STATUS_RETRYABLE.includes(+status)
+              ) {
+                throw error;
               }
             },
-            // If needed we can change some of the defaults here,
-            // but they're quite sensible.
             retries: this.maxRetries,
             randomize: true,
           }
         ),
       { throwOnTimeout: true }
     );
-  }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  callWithOptions<A extends any[], T extends (...args: A) => Promise<any>>(
-    options: AsyncCallerCallOptions,
-    callable: T,
-    ...args: Parameters<T>
-  ): Promise<Awaited<ReturnType<T>>> {
-    // Note this doesn't cancel the underlying request,
-    // when available prefer to use the signal option of the underlying call
+    // Decrement queue size when the call completes (success or failure)
+    if (sizeBytes > 0) {
+      promise = promise.finally(() => {
+        this.queueSizeBytes -= sizeBytes;
+      });
+    }
+
+    // Handle signal cancellation
     if (options.signal) {
       return Promise.race([
-        this.call<A, T>(callable, ...args),
+        promise,
         new Promise<never>((_, reject) => {
           options.signal?.addEventListener("abort", () => {
             reject(new Error("AbortError"));
@@ -153,15 +202,7 @@ export class AsyncCaller {
         }),
       ]);
     }
-    return this.call<A, T>(callable, ...args);
-  }
 
-  fetch(...args: Parameters<typeof fetch>): ReturnType<typeof fetch> {
-    return this.call(() =>
-      _getFetchImplementation(this.debug)(...args).then(
-        (res: Awaited<ReturnType<typeof fetch>>) =>
-          res.ok ? res : Promise.reject(res)
-      )
-    );
+    return promise;
   }
 }

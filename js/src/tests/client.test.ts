@@ -1,10 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { jest } from "@jest/globals";
-import { Client } from "../client.js";
+import { Client, mergeRuntimeEnvIntoRun } from "../client.js";
 import {
-  getEnvironmentVariables,
-  getLangChainEnvVars,
-  getLangChainEnvVarsMetadata,
+  getLangSmithEnvironmentVariables,
+  getLangSmithEnvVarsMetadata,
 } from "../utils/env.js";
 import {
   isVersionGreaterOrEqual,
@@ -182,26 +181,19 @@ describe("Client", () => {
       // eslint-disable-next-line no-process-env
       process.env.SOME_RANDOM_THING = "random";
 
-      const envVars = getEnvironmentVariables();
-      const langchainEnvVars = getLangChainEnvVars();
-      const langchainMetadataEnvVars = getLangChainEnvVarsMetadata();
+      const envVars = getLangSmithEnvironmentVariables();
+      const langchainMetadataEnvVars = getLangSmithEnvVarsMetadata();
 
       expect(envVars).toMatchObject({
-        LANGCHAIN_REVISION_ID: "test_revision_id",
-        LANGCHAIN_API_KEY: "fake_api_key",
-        LANGCHAIN_OTHER_KEY: "test_other_key",
-        LANGCHAIN_ENDPOINT: "https://example.com",
-        SOME_RANDOM_THING: "random",
-        LANGCHAIN_OTHER_NON_SENSITIVE_METADATA: "test_some_metadata",
-      });
-      expect(langchainEnvVars).toMatchObject({
         LANGCHAIN_REVISION_ID: "test_revision_id",
         LANGCHAIN_API_KEY: "fa********ey",
         LANGCHAIN_OTHER_KEY: "te**********ey",
         LANGCHAIN_ENDPOINT: "https://example.com",
         LANGCHAIN_OTHER_NON_SENSITIVE_METADATA: "test_some_metadata",
       });
-      expect(langchainEnvVars).not.toHaveProperty("SOME_RANDOM_THING");
+      expect(envVars).not.toHaveProperty("SOME_RANDOM_THING");
+
+      delete langchainMetadataEnvVars.LANGSMITH_TRACING;
       expect(langchainMetadataEnvVars).toEqual({
         revision_id: "test_revision_id",
         LANGCHAIN_OTHER_NON_SENSITIVE_METADATA: "test_some_metadata",
@@ -261,9 +253,656 @@ describe("Client", () => {
 
       invalidIdentifiers.forEach((identifier) => {
         expect(() => parsePromptIdentifier(identifier)).toThrowError(
-          `Invalid identifier format: ${identifier}`
+          /Invalid prompt identifier format/
         );
       });
+    });
+  });
+
+  describe("listCommits", () => {
+    it("should handle private prompts without explicit owner", async () => {
+      const client = new Client({ apiKey: "test-api-key" });
+
+      // Mock the _getPaginated method to capture the URL being called
+      let capturedUrl: string | undefined;
+      jest
+        .spyOn(client as any, "_getPaginated")
+        .mockImplementation(async function* (...args: any[]) {
+          capturedUrl = args[0];
+          yield [];
+        });
+
+      // Call listCommits with just the prompt name (no owner)
+      const commits = [];
+      for await (const commit of client.listCommits("my-prompt")) {
+        commits.push(commit);
+      }
+
+      // Verify that the URL uses "-" as the owner for private prompts
+      expect(capturedUrl).toBe("/commits/-/my-prompt/");
+    });
+
+    it("should handle prompts with explicit owner", async () => {
+      const client = new Client({ apiKey: "test-api-key" });
+
+      let capturedUrl: string | undefined;
+      jest
+        .spyOn(client as any, "_getPaginated")
+        .mockImplementation(async function* (...args: any[]) {
+          capturedUrl = args[0];
+          yield [];
+        });
+
+      // Call listCommits with owner/name format
+      const commits = [];
+      for await (const commit of client.listCommits("owner/my-prompt")) {
+        commits.push(commit);
+      }
+
+      // Verify that the URL uses the provided owner
+      expect(capturedUrl).toBe("/commits/owner/my-prompt/");
+    });
+
+    it("should handle prompts with commit specifier", async () => {
+      const client = new Client({ apiKey: "test-api-key" });
+
+      let capturedUrl: string | undefined;
+      jest
+        .spyOn(client as any, "_getPaginated")
+        .mockImplementation(async function* (...args: any[]) {
+          capturedUrl = args[0];
+          yield [];
+        });
+
+      // Call listCommits with prompt:commit format (commit part should be ignored for listCommits)
+      const commits = [];
+      for await (const commit of client.listCommits("my-prompt:abc123")) {
+        commits.push(commit);
+      }
+
+      // The commit identifier is parsed but not used in the URL (listCommits lists all commits)
+      expect(capturedUrl).toBe("/commits/-/my-prompt/");
+    });
+  });
+
+  describe("_filterForSampling patch logic", () => {
+    it("should filter patch runs based on trace_id instead of run.id", () => {
+      const client = new Client({
+        apiKey: "test-api-key",
+        tracingSamplingRate: 0.5,
+      });
+
+      // Mock the _shouldSample method to control sampling decisions
+      let counter = 0;
+      jest.spyOn(client as any, "_shouldSample").mockImplementation(() => {
+        counter += 1;
+        return counter % 2 === 0; // Accept even-numbered calls (2nd, 4th, etc.)
+      });
+
+      // Create two traces
+      const traceId1 = "trace-1";
+      const traceId2 = "trace-2";
+      const childRunId1 = "child-1";
+      const childRunId2 = "child-2";
+
+      // Create root runs (these will be sampled)
+      const rootRuns = [
+        {
+          id: traceId1,
+          trace_id: traceId1,
+          name: "root_run_1",
+          run_type: "llm" as const,
+          inputs: { text: "hello" },
+        },
+        {
+          id: traceId2,
+          trace_id: traceId2,
+          name: "root_run_2",
+          run_type: "llm" as const,
+          inputs: { text: "world" },
+        },
+      ];
+
+      // Test POST filtering (initial sampling)
+      const postFiltered = (client as any)._filterForSampling(rootRuns, false);
+
+      // Based on our mock, first call returns false, second returns true
+      // So only root_run_2 should be sampled
+      expect(postFiltered).toHaveLength(1);
+      expect(postFiltered[0].id).toBe(traceId2);
+
+      // Verify that traceId1 is in filtered set, traceId2 is not
+      expect((client as any).filteredPostUuids.has(traceId1)).toBe(true);
+      expect((client as any).filteredPostUuids.has(traceId2)).toBe(false);
+
+      // Test PATCH filtering - child runs should follow their trace's sampling decision
+      const patchRuns = [
+        {
+          id: childRunId1,
+          trace_id: traceId1,
+          name: "child_run_1",
+          run_type: "tool" as const,
+          inputs: { text: "child hello" },
+          outputs: { result: "child result 1" },
+        },
+        {
+          id: childRunId2,
+          trace_id: traceId2,
+          name: "child_run_2",
+          run_type: "tool" as const,
+          inputs: { text: "child world" },
+          outputs: { result: "child result 2" },
+        },
+      ];
+
+      const patchFiltered = (client as any)._filterForSampling(patchRuns, true);
+
+      // Only child_run_2 should be included (its trace was sampled)
+      // child_run_1 should be filtered out (its trace was not sampled)
+      expect(patchFiltered).toHaveLength(1);
+      expect(patchFiltered[0].id).toBe(childRunId2);
+      expect(patchFiltered[0].trace_id).toBe(traceId2);
+    });
+
+    it("should remove trace_id from filtered set when processing root run patches", () => {
+      const client = new Client({
+        apiKey: "test-api-key",
+        tracingSamplingRate: 0.5,
+      });
+
+      // Mock the _shouldSample method to reject first trace, accept second
+      let counter = 0;
+      jest.spyOn(client as any, "_shouldSample").mockImplementation(() => {
+        counter += 1;
+        return counter % 2 === 0;
+      });
+
+      const traceId1 = "trace-1";
+      const traceId2 = "trace-2";
+
+      // Create root runs and sample them
+      const rootRuns = [
+        {
+          id: traceId1,
+          trace_id: traceId1,
+          name: "root_run_1",
+          run_type: "llm" as const,
+          inputs: { text: "hello" },
+        },
+        {
+          id: traceId2,
+          trace_id: traceId2,
+          name: "root_run_2",
+          run_type: "llm" as const,
+          inputs: { text: "world" },
+        },
+      ];
+
+      (client as any)._filterForSampling(rootRuns, false);
+
+      // Verify initial state
+      expect((client as any).filteredPostUuids.has(traceId1)).toBe(true);
+      expect((client as any).filteredPostUuids.has(traceId2)).toBe(false);
+
+      // Test PATCH filtering for root runs (updates to the root runs themselves)
+      const rootPatchRuns = [
+        {
+          id: traceId1,
+          trace_id: traceId1,
+          name: "root_run_1",
+          run_type: "llm" as const,
+          inputs: { text: "hello" },
+          outputs: { result: "root result 1" },
+        },
+        {
+          id: traceId2,
+          trace_id: traceId2,
+          name: "root_run_2",
+          run_type: "llm" as const,
+          inputs: { text: "world" },
+          outputs: { result: "root result 2" },
+        },
+      ];
+
+      const rootPatchFiltered = (client as any)._filterForSampling(
+        rootPatchRuns,
+        true
+      );
+
+      // Only root_run_2 should be included, and traceId1 should be removed from filtered set
+      // since we're updating the root run that was originally filtered
+      expect(rootPatchFiltered).toHaveLength(1);
+      expect(rootPatchFiltered[0].id).toBe(traceId2);
+
+      // traceId1 should be removed from filtered set since we processed its root run
+      expect((client as any).filteredPostUuids.has(traceId1)).toBe(false);
+      expect((client as any).filteredPostUuids.has(traceId2)).toBe(false);
+    });
+
+    it("should handle mixed traces with patch sampling", () => {
+      const client = new Client({
+        apiKey: "test-api-key",
+        tracingSamplingRate: 0.5,
+      });
+
+      // Mock sampling to accept every other trace
+      let counter = 0;
+      jest.spyOn(client as any, "_shouldSample").mockImplementation(() => {
+        counter += 1;
+        return counter % 2 === 1; // Accept odd-numbered calls (1st, 3rd, etc.)
+      });
+
+      // Create multiple traces
+      const traceIds = ["trace-0", "trace-1", "trace-2", "trace-3"];
+      const childRunIds = ["child-0", "child-1", "child-2", "child-3"];
+
+      // Create root runs
+      const rootRuns = traceIds.map((traceId, i) => ({
+        id: traceId,
+        trace_id: traceId,
+        name: `root_run_${i}`,
+        run_type: "llm" as const,
+        inputs: { text: `hello ${i}` },
+      }));
+
+      // Sample the root runs
+      const postFiltered = (client as any)._filterForSampling(rootRuns, false);
+
+      // Based on our mock: 1st and 3rd calls return true (indices 0, 2)
+      expect(postFiltered).toHaveLength(2);
+      const sampledTraceIds = new Set(postFiltered.map((run: any) => run.id));
+      expect(sampledTraceIds.has(traceIds[0])).toBe(true);
+      expect(sampledTraceIds.has(traceIds[2])).toBe(true);
+
+      // Create child runs for all traces
+      const childRuns = traceIds.map((traceId, i) => ({
+        id: childRunIds[i],
+        trace_id: traceId,
+        name: `child_run_${i}`,
+        run_type: "tool" as const,
+        inputs: { text: `child ${i}` },
+        outputs: { result: `child result ${i}` },
+      }));
+
+      // Test patch filtering for child runs
+      const patchFiltered = (client as any)._filterForSampling(childRuns, true);
+
+      // Only children of sampled traces should be included
+      expect(patchFiltered).toHaveLength(2);
+      const patchTraceIds = new Set(
+        patchFiltered.map((run: any) => run.trace_id)
+      );
+      expect(patchTraceIds.has(traceIds[0])).toBe(true);
+      expect(patchTraceIds.has(traceIds[2])).toBe(true);
+      expect(patchTraceIds.has(traceIds[1])).toBe(false);
+      expect(patchTraceIds.has(traceIds[3])).toBe(false);
+    });
+  });
+
+  describe("Workspace Support", () => {
+    // eslint-disable-next-line no-process-env
+    const originalEnv = process.env;
+
+    beforeEach(() => {
+      jest.resetModules();
+      // eslint-disable-next-line no-process-env
+      process.env = { ...originalEnv };
+    });
+
+    afterEach(() => {
+      // eslint-disable-next-line no-process-env
+      process.env = originalEnv;
+    });
+
+    it("should read workspaceId from environment variable", () => {
+      // eslint-disable-next-line no-process-env
+      process.env.LANGSMITH_WORKSPACE_ID = "env-workspace-id";
+      const client = new Client();
+      expect((client as any).workspaceId).toBe("env-workspace-id");
+    });
+
+    it("should prioritize config over environment variable", () => {
+      // eslint-disable-next-line no-process-env
+      process.env.LANGSMITH_WORKSPACE_ID = "env-workspace-id";
+      const client = new Client({ workspaceId: "config-workspace-id" });
+      expect((client as any).workspaceId).toBe("config-workspace-id");
+    });
+
+    describe("E2E Workspace Tests", () => {
+      it("should include workspace ID in headers when making API calls", async () => {
+        // set env vars
+        // eslint-disable-next-line no-process-env
+        process.env.LANGSMITH_API_KEY = "test-api-key";
+        // eslint-disable-next-line no-process-env
+        process.env.LANGSMITH_WORKSPACE_ID = "test-workspace-id";
+
+        // Create mock fetch function
+        const mockFetch = jest.fn().mockImplementation(async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({ id: "run-123", name: "test-run" }),
+          text: async () => '{"id":"run-123","name":"test-run"}',
+        }));
+
+        const client = new Client({
+          fetchImplementation: mockFetch as any,
+        });
+
+        // API call
+        await client.createRun({
+          name: "test-run",
+          run_type: "llm",
+          inputs: { text: "hello" },
+        });
+
+        // Verify the call was made with correct headers
+        expect(mockFetch).toHaveBeenCalledWith(
+          expect.stringContaining("/runs"),
+          expect.objectContaining({
+            method: "POST",
+            headers: expect.objectContaining({
+              "x-tenant-id": "test-workspace-id",
+              "x-api-key": "test-api-key",
+            }),
+          })
+        );
+
+        // eslint-disable-next-line no-process-env
+        delete process.env.LANGSMITH_API_KEY;
+        // eslint-disable-next-line no-process-env
+        delete process.env.LANGSMITH_WORKSPACE_ID;
+      });
+
+      it("should handle org-scoped key error and throw workspace validation error", async () => {
+        // Create mock fetch function that returns 403 with org-scoped error
+        const mockFetch = jest.fn().mockImplementation(async () => ({
+          ok: false,
+          status: 403,
+          statusText: "Forbidden",
+          json: async () => ({ error: "org_scoped_key_requires_workspace" }),
+          text: async () => '{"error":"org_scoped_key_requires_workspace"}',
+        }));
+
+        const client = new Client({
+          apiKey: "org-scoped-key",
+          fetchImplementation: mockFetch as any,
+        });
+
+        // call API without workspace - should fail with workspace validation error
+        await expect(
+          client.createRun({
+            name: "test-run",
+            run_type: "llm",
+            inputs: { text: "hello" },
+          })
+        ).rejects.toThrow("[403]: Forbidden");
+
+        expect(mockFetch).toHaveBeenCalled();
+      });
+
+      it("should handle other 403 errors without throwing workspace validation error", async () => {
+        // Create mock fetch function that returns 403 with different error
+        const mockFetch = jest.fn().mockImplementation(async () => ({
+          ok: false,
+          status: 403,
+          statusText: "Forbidden",
+          json: async () => ({ error: "insufficient_permissions" }),
+          text: async () => '{"error":"insufficient_permissions"}',
+        }));
+
+        const client = new Client({
+          apiKey: "test-key",
+          fetchImplementation: mockFetch as any,
+        });
+
+        // call API - should fail with regular error
+        await expect(
+          client.createRun({
+            name: "test-run",
+            run_type: "llm",
+            inputs: { text: "hello" },
+          })
+        ).rejects.toThrow("Failed to create run");
+
+        expect(mockFetch).toHaveBeenCalled();
+      });
+
+      it("should work correctly when workspace is provided in options", async () => {
+        // Create mock fetch function
+        const mockFetch = jest.fn().mockImplementation(async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({ id: "run-123", name: "test-run" }),
+          text: async () => '{"id":"run-123","name":"test-run"}',
+        }));
+
+        const client = new Client({
+          apiKey: "org-scoped-key",
+          fetchImplementation: mockFetch as any,
+        });
+
+        // call with workspace ID in options should succeed
+        await client.createRun(
+          {
+            name: "test-run",
+            run_type: "llm",
+            inputs: { text: "hello" },
+          },
+          { workspaceId: "test-workspace-id" }
+        );
+
+        // check call was made with correct headers
+        expect(mockFetch).toHaveBeenCalledWith(
+          expect.stringContaining("/runs"),
+          expect.objectContaining({
+            method: "POST",
+            headers: expect.objectContaining({
+              "x-tenant-id": "test-workspace-id",
+            }),
+          })
+        );
+      });
+
+      it("should handle multiple API calls with different workspace configurations", async () => {
+        // Create mock fetch function
+        const mockFetch = jest.fn().mockImplementation(async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({ id: "run-123", name: "test-run" }),
+          text: async () => '{"id":"run-123","name":"test-run"}',
+        }));
+
+        const client = new Client({
+          apiKey: "test-api-key",
+          workspaceId: "default-workspace-id",
+          fetchImplementation: mockFetch as any,
+        });
+
+        // first call uses default workspace
+        await client.createRun({
+          name: "test-run",
+          run_type: "llm",
+          inputs: { text: "hello" },
+        });
+
+        // second call overrides workspace
+        await client.updateRun(
+          "550e8400-e29b-41d4-a716-446655440000",
+          {
+            outputs: { result: "updated" },
+          },
+          { workspaceId: "override-workspace-id" }
+        );
+
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+
+        const firstCall = mockFetch.mock.calls[0];
+        const secondCall = mockFetch.mock.calls[1];
+
+        expect((firstCall[1] as any).headers["x-tenant-id"]).toBe(
+          "default-workspace-id"
+        );
+        expect((secondCall[1] as any).headers["x-tenant-id"]).toBe(
+          "override-workspace-id"
+        );
+      });
+    });
+  });
+
+  describe("listRuns", () => {
+    it("should warn when child_run_ids is in select parameter", async () => {
+      const consoleWarnSpy = jest
+        .spyOn(console, "warn")
+        .mockImplementation(() => {});
+
+      // Create mock fetch function
+      const mockFetch = jest.fn().mockImplementation(async () => ({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({ runs: [] }),
+      }));
+
+      const client = new Client({
+        apiKey: "org-scoped-key",
+        fetchImplementation: mockFetch as any,
+      });
+
+      // Test that warning is issued when child_run_ids is in select
+      const runs = [];
+      for await (const run of client.listRuns({
+        projectId: "00000000-0000-0000-0000-000000000000",
+        select: ["id", "name", "child_run_ids"],
+      })) {
+        runs.push(run);
+      }
+
+      expect(consoleWarnSpy).toHaveBeenCalledWith(
+        expect.stringMatching(
+          "Deprecated: 'child_run_ids' in the listRuns select parameter is deprecated and will be removed in a future version."
+        )
+      );
+      consoleWarnSpy.mockClear();
+
+      // Test that no warning is issued when child_run_ids is not in select
+      for await (const run of client.listRuns({
+        projectId: "00000000-0000-0000-0000-000000000000",
+        select: ["id", "name"],
+      })) {
+        runs.push(run);
+      }
+
+      expect(consoleWarnSpy).not.toHaveBeenCalled();
+      consoleWarnSpy.mockRestore();
+    });
+  });
+
+  describe("omitTracedRuntimeInfo", () => {
+    it("should omit runtime info when flag is true", () => {
+      const run: any = {
+        id: "test-run-id",
+        name: "test-run",
+        run_type: "llm" as const,
+        inputs: { text: "hello" },
+      };
+
+      const result = mergeRuntimeEnvIntoRun(run, undefined, true);
+
+      expect(result.extra).toBeUndefined();
+    });
+
+    it("should include runtime info when flag is false", () => {
+      const run: any = {
+        id: "test-run-id",
+        name: "test-run",
+        run_type: "llm" as const,
+        inputs: { text: "hello" },
+      };
+
+      const result = mergeRuntimeEnvIntoRun(run, undefined, false);
+
+      expect(result.extra).toBeDefined();
+      expect(result.extra.runtime).toBeDefined();
+      expect(result.extra.metadata).toBeDefined();
+    });
+  });
+
+  describe("listRuns normalizes naive timestamps", () => {
+    it("should append Z to naive timestamps returned by the API", async () => {
+      const client = new Client({ apiKey: "test-api-key" });
+
+      const naiveRun = {
+        id: "run-1",
+        name: "test-run",
+        run_type: "chain",
+        inputs: {},
+        start_time: "2026-03-12T19:38:10.269893",
+        end_time: "2026-03-12T19:38:11.000000",
+        session_id: "proj-1",
+        trace_id: "run-1",
+        dotted_order: "20260312T193810269893Zrun-1",
+      };
+
+      const mockResponse = {
+        runs: [naiveRun],
+        cursors: {},
+      };
+
+      jest.spyOn(client as any, "_fetch").mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => mockResponse,
+        text: async () => JSON.stringify(mockResponse),
+      });
+
+      const runs: any[] = [];
+      for await (const run of client.listRuns({ projectId: "proj-1" })) {
+        runs.push(run);
+      }
+
+      expect(runs).toHaveLength(1);
+      expect(runs[0].start_time).toBe("2026-03-12T19:38:10.269893Z");
+      expect(runs[0].end_time).toBe("2026-03-12T19:38:11.000000Z");
+    });
+
+    it("should not double-append Z to already-aware timestamps", async () => {
+      const client = new Client({ apiKey: "test-api-key" });
+
+      const awareRun = {
+        id: "run-2",
+        name: "test-run",
+        run_type: "chain",
+        inputs: {},
+        start_time: "2026-03-12T19:38:10.269893Z",
+        end_time: "2026-03-12T19:38:11.000000+00:00",
+        session_id: "proj-1",
+        trace_id: "run-2",
+        dotted_order: "20260312T193810269893Zrun-2",
+      };
+
+      const mockResponse = {
+        runs: [awareRun],
+        cursors: {},
+      };
+
+      jest.spyOn(client as any, "_fetch").mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => mockResponse,
+        text: async () => JSON.stringify(mockResponse),
+      });
+
+      const runs: any[] = [];
+      for await (const run of client.listRuns({ projectId: "proj-1" })) {
+        runs.push(run);
+      }
+
+      expect(runs).toHaveLength(1);
+      expect(runs[0].start_time).toBe("2026-03-12T19:38:10.269893Z");
+      expect(runs[0].end_time).toBe("2026-03-12T19:38:11.000000+00:00");
     });
   });
 });

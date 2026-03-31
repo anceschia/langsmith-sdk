@@ -8,7 +8,7 @@ import {
 import { shuffle } from "../utils/shuffle.js";
 import { AsyncCaller } from "../utils/async_caller.js";
 import { evaluate } from "./index.js";
-import pRetry from "p-retry";
+import pRetry from "../utils/p-retry/index.js";
 import { getCurrentRunTree, traceable } from "../traceable.js";
 
 type ExperimentResults = Awaited<ReturnType<typeof evaluate>>;
@@ -134,6 +134,7 @@ export interface ComparisonEvaluationResults {
   results: ComparisonEvaluationResultRow[];
 }
 
+/** @deprecated Use `evaluate` and pass two experiments as targets. */
 export async function evaluateComparative(
   experiments:
     | Array<string>
@@ -337,16 +338,20 @@ export async function evaluateComparative(
           })
         : await (evaluator as _ComparativeEvaluatorLegacy)(runs, example);
 
+    // Build a lookup for run metadata
+    const runsById = new Map(runs.map((r) => [r.id, r]));
     for (const [runId, score] of Object.entries(result.scores)) {
       // validate if the run id
       if (!expectedRunIds.has(runId)) {
         throw new Error(`Returning an invalid run id ${runId} from evaluator.`);
       }
-
+      const run = runsById.get(runId);
       await client.createFeedback(runId, result.key, {
         score,
         sourceRunId: result.source_run_id,
         comparativeExperimentId: comparativeExperiment.id,
+        sessionId: run?.session_id,
+        startTime: run?.start_time,
       });
     }
 
@@ -404,5 +409,6 @@ export async function evaluateComparative(
   );
 
   const results: ComparisonEvaluationResultRow[] = await Promise.all(promises);
+  await client.awaitPendingTraceBatches();
   return { experimentName, results };
 }

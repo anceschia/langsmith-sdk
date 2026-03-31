@@ -7,7 +7,7 @@ import {
 
 import { SimpleEvaluationResult } from "../types.js";
 import { RunTree, RunTreeConfig } from "../../../run_trees.js";
-import { v4 } from "uuid";
+import { v7 } from "uuid";
 
 export type SimpleEvaluatorParams = {
   inputs: Record<string, any>;
@@ -47,7 +47,7 @@ export function wrapEvaluator<
         ].join("\n")
       );
     }
-    const evalRunId = config?.runId ?? config?.id ?? v4();
+    let evalRunId = config?.runId ?? config?.id ?? v7();
     let evalResult: O;
     if (trackingEnabled(context)) {
       const wrappedEvaluator = traceable(
@@ -57,12 +57,21 @@ export function wrapEvaluator<
         {
           id: evalRunId,
           trace_id: evalRunId,
+          on_end: (runTree) => {
+            // If tracing with OTEL, setting run id manually does not work.
+            // Instead get it at the end of the run.
+            evalRunId = runTree.id;
+          },
           reference_example_id: context.currentExample.id,
           client: context.client,
           tracingEnabled: true,
           name: evaluator.name ?? "<evaluator>",
           project_name: "evaluators",
           ...config,
+          extra: {
+            ...config?.extra,
+            ls_otel_root: true,
+          },
         }
       );
 
@@ -104,7 +113,7 @@ export async function evaluatedBy(outputs: any, evaluator: SimpleEvaluator) {
     );
   }
   const wrappedEvaluator = wrapEvaluator(evaluator);
-  const evalRunId = v4();
+  const evalRunId = v7();
   const evalResult = await wrappedEvaluator(
     {
       inputs: context.currentExample?.inputs ?? {},

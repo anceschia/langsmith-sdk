@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import gc
 import inspect
 import json
 import os
@@ -7,6 +8,7 @@ import sys
 import time
 import uuid
 import warnings
+import weakref
 from typing import (
     Any,
     AsyncGenerator,
@@ -31,6 +33,8 @@ from langsmith import schemas as ls_schemas
 from langsmith import utils as ls_utils
 from langsmith._internal import _aiter as aitertools
 from langsmith.run_helpers import (
+    _attachment_args_cache,
+    _cached_attachment_args,
     _get_inputs,
     _get_inputs_and_attachments_safe,
     as_runnable,
@@ -41,6 +45,7 @@ from langsmith.run_helpers import (
     tracing_context,
 )
 from langsmith.run_trees import RunTree
+from tests.unit_tests.conftest import parse_request_data
 
 
 def _get_calls(
@@ -67,7 +72,7 @@ def _get_calls(
 def _get_data(mock_calls: List[Any]) -> List[Tuple[str, dict]]:
     datas = []
     for call_ in mock_calls:
-        data = json.loads(call_.kwargs["data"])
+        data = parse_request_data(call_.kwargs["data"])
         for verb in ("post", "patch"):
             for payload in data.get(verb) or []:
                 datas.append((verb, payload))
@@ -230,6 +235,10 @@ def test__get_inputs_misnamed_and_required_keyword_only_args() -> None:
 
 
 def _get_mock_client(**kwargs: Any) -> Client:
+    ls_utils.get_env_var.cache_clear()
+    from langsmith.run_trees import _parse_write_replicas_from_env_var
+
+    _parse_write_replicas_from_env_var.cache_clear()
     mock_session = MagicMock()
     client = Client(session=mock_session, api_key="test", **kwargs)
     return client
@@ -280,7 +289,7 @@ def test_traceable_iterator(
     call = mock_calls[0]
     assert call.args[0] == "POST"
     assert call.args[1].startswith("https://api.smith.langchain.com")
-    body = json.loads(mock_calls[0].kwargs["data"])
+    body = parse_request_data(mock_calls[0].kwargs["data"])
     assert body["post"]
     assert body["post"][0]["outputs"]["output"] == expected
 
@@ -364,7 +373,9 @@ async def test_traceable_stream(
     call = mock_calls[0]
     assert call.args[0] == "POST"
     assert call.args[1].startswith("https://api.smith.langchain.com")
-    call_data = [json.loads(mock_call.kwargs["data"]) for mock_call in mock_calls]
+    call_data = [
+        parse_request_data(mock_call.kwargs["data"]) for mock_call in mock_calls
+    ]
     body = call_data[0]
     assert body["post"]
     assert body["post"][0]["name"] == "my_stream_fn"
@@ -379,7 +390,7 @@ async def test_traceable_stream(
                 assert False, "Could not get patch"
             mock_calls = _get_calls(mock_client, minimum=1)
             call_data = [
-                json.loads(mock_call.kwargs["data"]) for mock_call in mock_calls
+                parse_request_data(mock_call.kwargs["data"]) for mock_call in mock_calls
             ]
             first_patch = next((d for d in call_data if d.get("patch")), None)
             attempt += 1
@@ -417,7 +428,7 @@ async def test_traceable_async_iterator(use_next: bool, mock_client: Client) -> 
         call = mock_calls[0]
         assert call.args[0] == "POST"
         assert call.args[1].startswith("https://api.smith.langchain.com")
-        body = json.loads(call.kwargs["data"])
+        body = parse_request_data(call.kwargs["data"])
         assert body["post"]
         assert body["post"][0]["inputs"] == {"a": "FOOOOOO", "b": 2, "d": 3}
         outputs_ = body["post"][0]["outputs"]
@@ -427,7 +438,7 @@ async def test_traceable_async_iterator(use_next: bool, mock_client: Client) -> 
         else:
             # It was put in the second batch
             assert len(mock_calls) == 2
-            body_2 = json.loads(mock_calls[1].kwargs["data"])
+            body_2 = parse_request_data(mock_calls[1].kwargs["data"])
             assert body_2["patch"]
             assert body_2["patch"][0]["outputs"]["output"] == expected
 
@@ -442,6 +453,39 @@ def test_traceable_iterator_noargs(_: MagicMock) -> None:
     assert list(my_iterator_fn(1, 2, 3)) == [0, 1, 2, 3, 4, 5]
 
 
+def test_traceable_stream_context_manager_returns_wrapper(
+    mock_client: Client,
+) -> None:
+    with tracing_context(enabled=True):
+
+        @traceable(client=mock_client, reduce_fn=lambda chunks: chunks)
+        def my_stream_fn():
+            class SyncCtxStream:
+                def __init__(self) -> None:
+                    self.entered = False
+                    self.exited = False
+
+                def __enter__(self):
+                    self.entered = True
+                    return self
+
+                def __exit__(self, exc_type, exc_val, exc_tb):
+                    self.exited = True
+
+                def __iter__(self):
+                    return iter([])
+
+            stream = SyncCtxStream()
+            return stream
+
+        stream = my_stream_fn()
+        with stream as s:
+            assert s is stream
+        # Ensure the underlying stream context manager was used
+        assert stream.__ls_stream__.entered
+        assert stream.__ls_stream__.exited
+
+
 @patch("langsmith.run_trees.Client", autospec=True)
 async def test_traceable_async_iterator_noargs(_: MagicMock) -> None:
     # Check that it's callable without the parens
@@ -451,6 +495,49 @@ async def test_traceable_async_iterator_noargs(_: MagicMock) -> None:
             yield i
 
     assert [i async for i in my_iterator_fn(1, 2, 3)] == [0, 1, 2, 3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_traceable_async_stream_context_manager_returns_wrapper(
+    mock_client: Client,
+) -> None:
+    with tracing_context(enabled=True):
+
+        @traceable(client=mock_client, reduce_fn=lambda chunks: chunks)
+        async def my_stream_fn():
+            class AsyncCtxStream:
+                def __init__(self) -> None:
+                    self.entered = False
+                    self.exited = False
+                    self._done = False
+
+                async def __aenter__(self):
+                    self.entered = True
+                    return self
+
+                async def __aexit__(self, exc_type, exc_val, exc_tb):
+                    self.exited = True
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    if self._done:
+                        raise StopAsyncIteration
+                    self._done = True
+                    return "chunk"
+
+            stream = AsyncCtxStream()
+            return stream
+
+        stream = await my_stream_fn()
+        async with stream as s:
+            assert s is stream
+            collected = [item async for item in s]
+            assert collected == ["chunk"]
+        # Ensure the underlying stream context manager was used
+        assert stream.__ls_stream__.entered
+        assert stream.__ls_stream__.exited
 
 
 @patch("langsmith.client.requests.Session", autospec=True)
@@ -538,19 +625,19 @@ def test_traceable_parent_from_runnable_config() -> None:
             if call.args and call.args[0] != "GET":
                 assert call.args[0] == "POST"
                 assert call.args[1].startswith("https://api.smith.langchain.com")
-                body = json.loads(call.kwargs["data"])
+                body = parse_request_data(call.kwargs["data"])
                 assert body["post"]
                 posts.extend(body["post"])
         assert len(posts) == 2
-        parent = next(p for p in posts if p["parent_run_id"] is None)
-        child = next(p for p in posts if p["parent_run_id"] is not None)
+        parent = next(p for p in posts if p.get("parent_run_id") is None)
+        child = next(p for p in posts if p.get("parent_run_id") is not None)
         assert child["parent_run_id"] == parent["id"]
 
 
 def test_traceable_parent_from_runnable_config_accepts_config() -> None:
     try:
         from langchain.callbacks.tracers import LangChainTracer
-        from langchain.schema.runnable import RunnableLambda
+        from langchain_core.runnables import RunnableLambda
     except ImportError:
         pytest.skip("Skipping test that requires langchain")
     with tracing_context(enabled=True):
@@ -577,12 +664,12 @@ def test_traceable_parent_from_runnable_config_accepts_config() -> None:
             if call.args and call.args[0] != "GET":
                 assert call.args[0] == "POST"
                 assert call.args[1].startswith("https://api.smith.langchain.com")
-                body = json.loads(call.kwargs["data"])
+                body = parse_request_data(call.kwargs["data"])
                 assert body["post"]
                 posts.extend(body["post"])
         assert len(posts) == 2
-        parent = next(p for p in posts if p["parent_run_id"] is None)
-        child = next(p for p in posts if p["parent_run_id"] is not None)
+        parent = next(p for p in posts if p.get("parent_run_id") is None)
+        child = next(p for p in posts if p.get("parent_run_id") is not None)
         assert child["parent_run_id"] == parent["id"]
 
 
@@ -602,7 +689,7 @@ def test_traceable_project_name() -> None:
         call = mock_calls[0]
         assert call.args[0] == "POST"
         assert call.args[1].startswith("https://api.smith.langchain.com")
-        body = json.loads(call.kwargs["data"])
+        body = parse_request_data(call.kwargs["data"])
         assert body["post"]
         assert body["post"][0]["session_name"] == "my foo project"
 
@@ -622,7 +709,7 @@ def test_traceable_project_name() -> None:
         call = mock_calls[0]
         assert call.args[0] == "POST"
         assert call.args[1].startswith("https://api.smith.langchain.com")
-        body = json.loads(call.kwargs["data"])
+        body = parse_request_data(call.kwargs["data"])
         assert body["post"]
         assert body["post"][0]["session_name"] == "my bar project"
         assert body["post"][1]["session_name"] == "my bar project"
@@ -811,17 +898,6 @@ async def test_async_generator():
     assert run is not None
     run = cast(RunTree, run)
     assert run.name == "expand_and_answer_questions"
-    child_runs = run.child_runs
-    assert child_runs and len(child_runs) == 5
-    names = [run.name for run in child_runs]
-    assert names == [
-        "some_sync_func",
-        "some_async_func",
-        "another_async_func",
-        "create_document_context",
-        "summarize_answers",
-    ]
-    assert len(child_runs[2].child_runs) == 1  # type: ignore
 
 
 def test_generator():
@@ -911,17 +987,6 @@ def test_generator():
     assert run is not None
     run = cast(RunTree, run)
     assert run.name == "test_overridding_name"
-    child_runs = run.child_runs
-    assert child_runs and len(child_runs) == 5
-    names = [run.name for run in child_runs]
-    assert names == [
-        "some_sync_func",
-        "some_func",
-        "another_func",
-        "create_document_context",
-        "summarize_answers",
-    ]
-    assert len(child_runs[2].child_runs) == 1  # type: ignore
 
 
 @pytest.mark.parametrize("enabled", [True, "local"])
@@ -989,19 +1054,6 @@ def test_traceable_regular(enabled: Union[bool, Literal["local"]]):
     assert run is not None
     run = cast(RunTree, run)
     assert run.name == "expand_and_answer_questions"
-    child_runs = run.child_runs
-    assert child_runs and len(child_runs) == 5
-    names = [run.name for run in child_runs]
-    assert names == [
-        "some_sync_func",
-        "some_func",
-        "another_func",
-        "create_document_context",
-        "summarize_answers",
-    ]
-    assert len(child_runs[2].child_runs) == 1  # type: ignore
-    mock_calls = _get_calls(mock_client_)
-    assert len(mock_calls) == (0 if enabled == "local" else 1)
 
 
 @pytest.mark.parametrize("enabled", [True, "local"])
@@ -1075,19 +1127,6 @@ async def test_traceable_async(enabled: Union[bool, Literal["local"]]):
     assert run is not None
     run = cast(RunTree, run)
     assert run.name == "expand_and_answer_questions"
-    child_runs = run.child_runs
-    assert child_runs and len(child_runs) == 5
-    names = [run.name for run in child_runs]
-    assert names == [
-        "some_sync_func",
-        "some_async_func",
-        "another_async_func",
-        "create_document_context",
-        "summarize_answers",
-    ]
-    assert len(child_runs[2].child_runs) == 1  # type: ignore
-    mock_calls = _get_calls(mock_client_)
-    assert len(mock_calls) == (0 if enabled == "local" else 1)
 
 
 @pytest.mark.parametrize("enabled", [True, "local"])
@@ -1117,11 +1156,6 @@ def test_traceable_to_trace(enabled: Union[bool, Literal["local"]]):
     assert run.name == "parent_fn"
     assert run.outputs == {"output": 3}
     assert run.inputs == {"a": 1, "b": 2}
-    child_runs = run.child_runs
-    assert child_runs
-    assert len(child_runs) == 1
-    assert child_runs[0].name == "child_fn"
-    assert child_runs[0].inputs == {"a": 1, "b": 2}
     mock_calls = _get_calls(mock_client_)
     assert len(mock_calls) == (0 if enabled == "local" else 1)
 
@@ -1168,23 +1202,6 @@ async def test_traceable_to_atrace(enabled: Union[bool, Literal["local"]]):
     assert run.name == "parent_fn"
     assert run.outputs == {"output": 3}
     assert run.inputs == {"a": 1, "b": 2}
-    child_runs = run.child_runs
-    assert child_runs
-    assert len(child_runs) == 1
-    child = child_runs[0]
-    assert child.name == "child_fn"
-    assert child.inputs == {"a": 1, "b": 2}
-    assert len(child.child_runs) == 1
-    grandchild = child.child_runs[0]
-    assert grandchild.name == "grandchild_fn"
-    assert grandchild.inputs == {"a": 1, "b": 2, "c": "oh my"}
-    assert len(grandchild.child_runs) == 2
-    ggcerror = grandchild.child_runs[0]
-    assert ggcerror.name == "expect_error"
-    assert "oh no" in str(ggcerror.error)
-    ggc = grandchild.child_runs[1]
-    assert ggc.name == "great_grandchild_fn"
-    assert ggc.inputs == {"a": 1, "b": 2}
     mock_calls = _get_calls(mock_client_)
     assert len(mock_calls) == (0 if enabled == "local" else 1)
 
@@ -1209,11 +1226,6 @@ def test_trace_to_traceable(enabled: Union[bool, Literal["local"]]):
     assert run.name == "parent_fn"
     assert run.outputs == {"result": 3}
     assert run.inputs == {"a": 1, "b": 2}
-    child_runs = run.child_runs
-    assert child_runs
-    assert len(child_runs) == 1
-    assert child_runs[0].name == "child_fn"
-    assert child_runs[0].inputs == {"a": 1, "b": 2}
 
 
 def test_client_not_passed_when_traceable_parent():
@@ -1244,7 +1256,7 @@ def test_client_passed_when_trace_parent():
     call = calls[0]
     assert call.args[0] == "POST"
     assert call.args[1].startswith("https://api.smith.langchain.com")
-    body = json.loads(call.kwargs["data"])
+    body = parse_request_data(call.kwargs["data"])
     assert body["post"]
     assert body["post"][0]["inputs"] == {"foo": "bar"}
     assert body["post"][0]["outputs"] == {"bar": "baz"}
@@ -1354,7 +1366,7 @@ def test_io_interops():
     assert parent_result == expected_at_stage["parent_output"]
     mock_posts = _get_calls(tracer.client, minimum=5)
     assert len(mock_posts) == 5
-    datas = [json.loads(mock_post.kwargs["data"]) for mock_post in mock_posts]
+    datas = [parse_request_data(mock_post.kwargs["data"]) for mock_post in mock_posts]
     names = [
         "the_parent",
         "child",
@@ -1385,7 +1397,7 @@ def test_io_interops():
     mock_patches = _get_calls(tracer.client, verbs={"PATCH"}, minimum=5)
     assert len(mock_patches) == 5
     patches_datas = [
-        json.loads(mock_patch.kwargs["data"]) for mock_patch in mock_patches
+        parse_request_data(mock_patch.kwargs["data"]) for mock_patch in mock_patches
     ]
     patches_dict = {d["id"]: d for d in patches_datas}
     child_patch = patches_dict[ids["child"]]
@@ -1431,7 +1443,7 @@ def test_trace_nested_enable_disable():
     # run -> run3
     # with run2 being invisible
     mock_calls = _get_calls(mock_client, verbs={"POST", "PATCH"})
-    datas = [json.loads(mock_post.kwargs["data"]) for mock_post in mock_calls]
+    datas = [parse_request_data(mock_post.kwargs["data"]) for mock_post in mock_calls]
     assert "post" in datas[0]
     posted = datas[0]["post"]
     assert len(posted) == 2
@@ -1494,6 +1506,7 @@ async def test_traceable_async_exception(auto_batch_tracing: bool):
 
 @pytest.mark.parametrize("auto_batch_tracing", [True, False])
 async def test_traceable_async_gen_exception(auto_batch_tracing: bool):
+    ls_utils.get_env_var.cache_clear()
     mock_client = _get_mock_client(
         auto_batch_tracing=auto_batch_tracing,
         info=ls_schemas.LangSmithInfo(
@@ -1534,6 +1547,7 @@ async def test_traceable_async_gen_exception(auto_batch_tracing: bool):
 
 @pytest.mark.parametrize("auto_batch_tracing", [True, False])
 async def test_traceable_gen_exception(auto_batch_tracing: bool):
+    ls_utils.get_env_var.cache_clear()
     mock_client = _get_mock_client(
         auto_batch_tracing=auto_batch_tracing,
         info=ls_schemas.LangSmithInfo(
@@ -1628,7 +1642,7 @@ async def test_process_inputs_outputs():
         call = mock_calls[0]
         assert call.args[0] == "POST"
         assert call.args[1].startswith("https://api.smith.langchain.com")
-        body = json.loads(call.kwargs["data"])
+        body = parse_request_data(call.kwargs["data"])
         assert body["post"]
         assert body["post"][0]["inputs"] == {
             "serialized_in": "what's the meaning of life?"
@@ -1784,15 +1798,15 @@ def test_traceable_input_attachments():
                 break
             time.sleep(1)
 
-        # main run, inputs, outputs, events, att1, att2, anoutput
-        assert len(datas) == 7
-        # First 4 are type application/json (run, inputs, outputs, events)
+        # main run, inputs, outputs, events, extra, att1, att2, anoutput
+        assert len(datas) == 8
         trace_id = datas[0][0].split(".")[1]
-        _, (_, run_stuff) = next(
-            data for data in datas if data[0] == f"post.{trace_id}"
+
+        _, (_, extra_stuff) = next(
+            data for data in datas if data[0] == f"post.{trace_id}.extra"
         )
         assert (
-            json.loads(run_stuff)["extra"]["runtime"].get(
+            json.loads(extra_stuff)["runtime"].get(
                 "LANGSMITH_test_traceable_input_attachments"
             )
             == "aval"
@@ -1840,6 +1854,64 @@ def test__get_inputs_and_attachments_safe_unhashable_default() -> None:
     assert expected == actual
 
 
+def test_attachment_detection_with_string_annotations() -> None:
+    """Test that string annotations are handled correctly."""
+
+    # Create a function with string annotations manually
+    def foo(bar: "Annotated[bytes, ls_schemas.Attachment]"):
+        return "test"
+
+    sig = inspect.signature(foo)
+    test_attachment = ls_schemas.Attachment(mime_type="text/plain", data=b"test")
+    inputs, attachments = _get_inputs_and_attachments_safe(
+        sig, test_attachment, func=foo
+    )
+
+    assert inputs == {}
+    assert attachments == {"bar": test_attachment}
+
+
+def test_cached_attachment_args_no_leak() -> None:
+    """Closure funcs passed to _cached_attachment_args should not be retained."""
+    _cached_attachment_args.cache_clear()
+
+    class Ctx:
+        def __init__(self):
+            self.buf = "x" * 1_000_000
+
+    refs = []
+    for _ in range(10):
+        ctx = Ctx()
+        ref = weakref.ref(ctx)
+
+        def closure(ctx=ctx):
+            return len(ctx.buf)
+
+        _cached_attachment_args(inspect.signature(closure), closure)
+        refs.append(ref)
+        del ctx, closure
+
+    gc.collect()
+    alive = sum(1 for r in refs if r() is not None)
+    assert alive == 0, f"{alive}/10 closure contexts still alive"
+    assert len(_attachment_args_cache) == 0
+
+
+def test_cached_attachment_args_non_weakrefable_callable() -> None:
+    _cached_attachment_args.cache_clear()
+
+    class CallableNoWeakref:
+        __slots__ = ()
+
+        def __call__(self, bar: ls_schemas.Attachment) -> ls_schemas.Attachment:
+            return bar
+
+    fn = CallableNoWeakref()
+    signature = inspect.signature(fn)
+    assert _cached_attachment_args(signature, fn) == {"bar"}
+    assert len(_attachment_args_cache) == 0
+
+
 def test_traceable_iterator_process_chunk(mock_client: Client) -> None:
     with tracing_context(enabled=True):
 
@@ -1860,9 +1932,30 @@ def test_traceable_iterator_process_chunk(mock_client: Client) -> None:
     call = mock_calls[0]
     assert call.args[0] == "POST"
     assert call.args[1].startswith("https://api.smith.langchain.com")
-    body = json.loads(mock_calls[0].kwargs["data"])
+    body = parse_request_data(mock_calls[0].kwargs["data"])
     assert body["post"]
     assert body["post"][0]["outputs"]["output"] == list(range(6))
+
+
+def test_first_token_event_only(mock_client: Client) -> None:
+    collected_run: Optional[RunTree] = None
+
+    def on_end(run: RunTree) -> None:
+        nonlocal collected_run
+        collected_run = run
+
+    with tracing_context(enabled=True):
+
+        @traceable(client=mock_client, run_type="llm")
+        def token_stream() -> Generator[str, None, None]:
+            for t in ["a", "b", "c"]:
+                yield t
+
+        list(token_stream(langsmith_extra={"on_end": on_end}))
+
+    assert collected_run is not None
+    events = [ev for ev in collected_run.events if ev.get("name") == "new_token"]
+    assert len(events) == 1
 
 
 async def test_traceable_async_iterator_process_chunk(mock_client: Client) -> None:
@@ -1885,6 +1978,500 @@ async def test_traceable_async_iterator_process_chunk(mock_client: Client) -> No
     call = mock_calls[0]
     assert call.args[0] == "POST"
     assert call.args[1].startswith("https://api.smith.langchain.com")
-    body = json.loads(mock_calls[0].kwargs["data"])
+    body = parse_request_data(mock_calls[0].kwargs["data"])
     assert body["post"]
     assert body["post"][0]["outputs"]["output"] == list(range(6))
+
+
+def test_set_run_metadata_updates_current_run_tree() -> None:
+    with tracing_context(enabled=True):
+
+        @traceable
+        def instrumented() -> RunTree:
+            langsmith.set_run_metadata(foo=1)
+            langsmith.set_run_metadata(bar="two")
+            rt = get_current_run_tree()
+            assert rt is not None
+            return rt
+
+        run_tree = instrumented()
+    assert run_tree.metadata["foo"] == 1
+    assert run_tree.metadata["bar"] == "two"
+
+
+def test_set_run_metadata_without_active_run_tree(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    langsmith.set_run_metadata(foo=1)
+    run_helper_logs = [
+        record for record in caplog.records if record.name == "langsmith.run_helpers"
+    ]
+    assert len(run_helper_logs) == 1
+    assert "No active run tree found" in run_helper_logs[0].message
+
+
+# Tests for enabled parameter on @traceable decorator
+
+
+def test_traceable_enabled_false_overrides_context(mock_client: Client) -> None:
+    """Verify that enabled=False on decorator disables tracing.
+
+    Even with tracing_context(enabled=True).
+    """
+
+    @traceable(client=mock_client, enabled=False)
+    def my_function(a: int) -> int:
+        return a * 2
+
+    with tracing_context(enabled=True):
+        result = my_function(5)
+
+    assert result == 10
+    mock_calls = _get_calls(mock_client)
+    assert len(mock_calls) == 0  # No tracing should occur
+
+
+def test_traceable_enabled_true_overrides_context(mock_client: Client) -> None:
+    """Verify that enabled=True on decorator forces tracing.
+
+    Even with tracing_context(enabled=False).
+    """
+
+    @traceable(client=mock_client, enabled=True)
+    def my_function(a: int) -> int:
+        return a * 2
+
+    with tracing_context(enabled=False):
+        result = my_function(5)
+
+    assert result == 10
+    mock_calls = _get_calls(mock_client, minimum=1)
+    assert len(mock_calls) >= 1  # Tracing should occur despite context
+
+
+def test_traceable_enabled_none_respects_context_enabled(mock_client: Client) -> None:
+    """Verify that enabled=None (default) follows tracing_context when enabled."""
+
+    @traceable(client=mock_client)  # enabled defaults to None
+    def my_function(a: int) -> int:
+        return a * 2
+
+    with tracing_context(enabled=True):
+        result = my_function(5)
+
+    assert result == 10
+    mock_calls = _get_calls(mock_client, minimum=1)
+    assert len(mock_calls) >= 1  # Tracing should occur
+
+
+def test_traceable_enabled_none_respects_context_disabled(mock_client: Client) -> None:
+    """Verify that enabled=None (default) follows tracing_context when disabled."""
+
+    @traceable(client=mock_client)  # enabled defaults to None
+    def my_function(a: int) -> int:
+        return a * 2
+
+    with tracing_context(enabled=False):
+        result = my_function(5)
+
+    assert result == 10
+    mock_calls = _get_calls(mock_client)
+    assert len(mock_calls) == 0  # No tracing should occur
+
+
+def test_traceable_config_attribute(mock_client: Client) -> None:
+    """Verify that __traceable_config__ is set with correct values."""
+
+    def my_process_inputs(inputs: dict) -> dict:
+        return inputs
+
+    def my_process_outputs(outputs: Any) -> dict:
+        return {"output": outputs}
+
+    @traceable(
+        client=mock_client,
+        enabled=False,
+        process_inputs=my_process_inputs,
+        process_outputs=my_process_outputs,
+        tags=["tag1", "tag2"],
+        metadata={"key": "value"},
+    )
+    def my_function(a: int) -> int:
+        return a * 2
+
+    assert hasattr(my_function, "__traceable_config__")
+    config = my_function.__traceable_config__
+    assert config["enabled"] is False
+    assert config["process_inputs"] is my_process_inputs
+    assert config["process_outputs"] is my_process_outputs
+    assert config["tags"] == ["tag1", "tag2"]
+    assert config["metadata"] == {"key": "value"}
+
+
+def test_traceable_config_defaults(mock_client: Client) -> None:
+    """Verify that __traceable_config__ has correct defaults."""
+
+    @traceable(client=mock_client)
+    def my_function(a: int) -> int:
+        return a * 2
+
+    assert hasattr(my_function, "__traceable_config__")
+    config = my_function.__traceable_config__
+    assert config["enabled"] is None  # Should default to None
+    assert config["process_inputs"] is None
+    assert config["process_outputs"] is None
+    assert config["tags"] is None
+    assert config["metadata"] is None
+
+
+async def test_traceable_async_enabled_false(mock_client: Client) -> None:
+    """Verify that enabled=False works with async functions."""
+
+    @traceable(client=mock_client, enabled=False)
+    async def my_async_function(a: int) -> int:
+        return a * 2
+
+    with tracing_context(enabled=True):
+        result = await my_async_function(5)
+
+    assert result == 10
+    mock_calls = _get_calls(mock_client)
+    assert len(mock_calls) == 0  # No tracing should occur
+
+
+async def test_traceable_async_enabled_true_overrides_context(
+    mock_client: Client,
+) -> None:
+    """Verify that enabled=True forces tracing for async functions.
+
+    Even when context is disabled.
+    """
+
+    @traceable(client=mock_client, enabled=True)
+    async def my_async_function(a: int) -> int:
+        return a * 2
+
+    with tracing_context(enabled=False):
+        result = await my_async_function(5)
+
+    assert result == 10
+    mock_calls = _get_calls(mock_client, minimum=1)
+    assert len(mock_calls) >= 1  # Tracing should occur despite context
+
+
+def test_traceable_generator_enabled_false(mock_client: Client) -> None:
+    """Verify that enabled=False works with generator functions."""
+
+    @traceable(client=mock_client, enabled=False)
+    def my_generator(n: int) -> Generator[int, None, None]:
+        for i in range(n):
+            yield i
+
+    with tracing_context(enabled=True):
+        result = list(my_generator(5))
+
+    assert result == [0, 1, 2, 3, 4]
+    mock_calls = _get_calls(mock_client)
+    assert len(mock_calls) == 0  # No tracing should occur
+
+
+async def test_traceable_async_generator_enabled_false(mock_client: Client) -> None:
+    """Verify that enabled=False works with async generator functions."""
+
+    @traceable(client=mock_client, enabled=False)
+    async def my_async_generator(n: int) -> AsyncGenerator[int, None]:
+        for i in range(n):
+            yield i
+
+    with tracing_context(enabled=True):
+        result = [x async for x in my_async_generator(5)]
+
+    assert result == [0, 1, 2, 3, 4]
+    mock_calls = _get_calls(mock_client)
+    assert len(mock_calls) == 0  # No tracing should occur
+
+
+def test_traceable_enabled_does_not_propagate(mock_client: Client) -> None:
+    """Test that enabled setting applies only to its function, not nested calls."""
+
+    @traceable(client=mock_client, enabled=False)
+    def outer_function(a: int) -> int:
+        return inner_function(a)
+
+    @traceable(client=mock_client, enabled=True)
+    def inner_function(a: int) -> int:
+        return a * 2
+
+    with tracing_context(enabled=True):
+        result = outer_function(5)
+
+    assert result == 10
+    mock_calls = _get_calls(mock_client, minimum=1)
+    datas = _get_data(mock_calls)
+    # outer_function should NOT be traced (enabled=False)
+    # inner_function SHOULD be traced (enabled=True) - setting doesn't propagate
+    names = [p.get("name") for _, p in datas if p.get("name")]
+    assert "outer_function" not in names
+    assert "inner_function" in names
+
+
+def test_traceable_nested_outer_enabled_inner_disabled(mock_client: Client) -> None:
+    """Test nested functions where outer is enabled and inner is disabled."""
+
+    @traceable(client=mock_client, enabled=True)
+    def outer_function(a: int) -> int:
+        return inner_function(a)
+
+    @traceable(client=mock_client, enabled=False)
+    def inner_function(a: int) -> int:
+        return a * 2
+
+    with tracing_context(enabled=True):
+        result = outer_function(5)
+
+    assert result == 10
+    mock_calls = _get_calls(mock_client, minimum=1)
+    datas = _get_data(mock_calls)
+    # Only outer_function should be traced, not inner_function
+    names = [p.get("name") for _, p in datas if p.get("name")]
+    assert "outer_function" in names
+    assert "inner_function" not in names
+
+
+@pytest.mark.parametrize(
+    "decorator_enabled,context_enabled,should_trace",
+    [
+        (None, True, True),  # None follows context
+        (None, False, False),  # None follows context
+        (True, True, True),  # True forces on
+        (True, False, True),  # True forces on (override context)
+        (False, True, False),  # False forces off (override context)
+        (False, False, False),  # False forces off
+    ],
+)
+def test_traceable_enabled_matrix(
+    decorator_enabled: Optional[bool],
+    context_enabled: bool,
+    should_trace: bool,
+) -> None:
+    """Test all combinations of decorator enabled and context enabled."""
+    mock_client = _get_mock_client()
+
+    if decorator_enabled is None:
+
+        @traceable(client=mock_client)
+        def my_function(a: int) -> int:
+            return a * 2
+
+    else:
+
+        @traceable(client=mock_client, enabled=decorator_enabled)
+        def my_function(a: int) -> int:
+            return a * 2
+
+    with tracing_context(enabled=context_enabled):
+        result = my_function(5)
+
+    assert result == 10
+    mock_calls = _get_calls(mock_client, minimum=1 if should_trace else 0)
+    if should_trace:
+        assert len(mock_calls) >= 1
+    else:
+        assert len(mock_calls) == 0
+
+
+def test_traceable_triple_decorated(mock_client: Client) -> None:
+    """Test that other decorators don't affect tracing."""
+
+    def some_decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    def some_other_decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    @some_decorator
+    def original_function(a: int) -> str:
+        return f"foo {a}"
+
+    wrapped_function = some_other_decorator(
+        (traceable(client=mock_client, enabled=True)((original_function)))
+    )
+
+    result = wrapped_function(5)
+
+    assert result == "foo 5"
+    mock_calls = _get_calls(mock_client, minimum=1)
+    datas = _get_data(mock_calls)
+    names = [p.get("name") for _, p in datas if p.get("name")]
+    assert "outer_function" not in names
+    assert "original_function" in names
+    config = wrapped_function.__traceable_config__
+    assert config["enabled"] is True  # Should default to None
+    assert config["process_inputs"] is None
+    assert config["process_outputs"] is None
+    assert config["tags"] is None
+    assert config["metadata"] is None
+    assert config["wrapped"] is original_function
+
+
+class TestTraceableExceptionsToHandle:
+    """Tests for the exceptions_to_handle parameter in @traceable decorator."""
+
+    @pytest.mark.parametrize("auto_batch_tracing", [True, False])
+    @pytest.mark.parametrize(
+        "func_type", ["sync", "async", "generator", "async_generator"]
+    )
+    def test_handled_exceptions(self, auto_batch_tracing: bool, func_type: str):
+        """exceptions_to_handle should suppress tracebacks for specified exceptions."""
+        mock_client = _get_mock_client(
+            auto_batch_tracing=auto_batch_tracing,
+            info=ls_schemas.LangSmithInfo(
+                batch_ingest_config=ls_schemas.BatchIngestConfig(
+                    size_limit_bytes=None,
+                    size_limit=100,
+                    scale_up_nthreads_limit=16,
+                    scale_up_qsize_trigger=1000,
+                    scale_down_nempty_trigger=4,
+                )
+            ),
+        )
+
+        if func_type == "sync":
+
+            @traceable(exceptions_to_handle=(ValueError,))
+            def f() -> int:
+                raise ValueError("handled exception")
+
+            def execute():
+                f(langsmith_extra={"client": mock_client})
+
+        elif func_type == "async":
+
+            @traceable(exceptions_to_handle=(ValueError,))
+            async def f() -> int:
+                raise ValueError("handled exception")
+
+            async def execute():
+                await f(langsmith_extra={"client": mock_client})
+
+        elif func_type == "generator":
+
+            @traceable(exceptions_to_handle=(ValueError,))
+            def f():
+                for i in range(3):
+                    yield i
+                raise ValueError("handled exception")
+
+            def execute():
+                for _ in f(langsmith_extra={"client": mock_client}):
+                    pass
+
+        else:  # async_generator
+
+            @traceable(exceptions_to_handle=(ValueError,))
+            async def f():
+                for i in range(3):
+                    yield i
+                raise ValueError("handled exception")
+
+            async def execute():
+                async for _ in f(langsmith_extra={"client": mock_client}):
+                    pass
+
+        with tracing_context(enabled=True):
+            with pytest.raises(ValueError, match="handled exception"):
+                if func_type in ("async", "async_generator"):
+                    asyncio.run(execute())
+                else:
+                    execute()
+
+        num_calls = 1 if auto_batch_tracing else 2
+        mock_calls = _get_calls(
+            mock_client, verbs={"POST", "PATCH", "GET"}, minimum=num_calls
+        )
+        assert len(mock_calls) >= num_calls
+
+        datas = _get_data(mock_calls)
+        for _, payload in datas:
+            if payload.get("error") is not None:
+                pytest.fail(f"Expected error to be None, got: {payload.get('error')}")
+
+    def test_unhandled_exceptions(self):
+        """Test that unhandled exceptions still log tracebacks."""
+        mock_client = _get_mock_client(
+            auto_batch_tracing=True,
+            info=ls_schemas.LangSmithInfo(
+                batch_ingest_config=ls_schemas.BatchIngestConfig(
+                    size_limit_bytes=None,
+                    size_limit=100,
+                    scale_up_nthreads_limit=16,
+                    scale_up_qsize_trigger=1000,
+                    scale_down_nempty_trigger=4,
+                )
+            ),
+        )
+
+        @traceable(exceptions_to_handle=(ValueError,))
+        def f() -> int:
+            raise TypeError("unhandled exception")
+
+        with tracing_context(enabled=True):
+            with pytest.raises(TypeError, match="unhandled exception"):
+                f(langsmith_extra={"client": mock_client})
+
+        # Verify that error is logged with traceback for unhandled exceptions
+        mock_calls = _get_calls(
+            mock_client, verbs={"POST", "PATCH", "GET"}, minimum=1, attempts=20
+        )
+        datas = _get_data(mock_calls)
+        found_error = False
+        for _, payload in datas:
+            if payload.get("error"):
+                found_error = True
+                assert "TypeError" in payload["error"]
+                assert "unhandled exception" in payload["error"]
+        assert found_error, "Expected to find error with traceback in the payloads"
+
+    def test_multiple_exception_types(self, mock_client: Client):
+        """Test that multiple exception types can be handled."""
+
+        @traceable(exceptions_to_handle=(ValueError, TypeError, KeyError))
+        def f(exc_type: str) -> int:
+            if exc_type == "value":
+                raise ValueError("value error")
+            elif exc_type == "type":
+                raise TypeError("type error")
+            elif exc_type == "key":
+                raise KeyError("key error")
+            return 42
+
+        with tracing_context(enabled=True):
+            # All three should be handled
+            with pytest.raises(ValueError):
+                f("value", langsmith_extra={"client": mock_client})
+
+            with pytest.raises(TypeError):
+                f("type", langsmith_extra={"client": mock_client})
+
+            with pytest.raises(KeyError):
+                f("key", langsmith_extra={"client": mock_client})
+
+        # Verify all were handled without traceback
+        mock_calls = _get_calls(mock_client, verbs={"POST", "PATCH"})
+        datas = _get_data(mock_calls)
+
+        for _, payload in datas:
+            # All handled exceptions should not have error field with traceback
+            if payload.get("error") is not None:
+                err = payload.get("error")
+                pytest.fail(
+                    f"Expected error to be None for handled exception, got: {err}"
+                )

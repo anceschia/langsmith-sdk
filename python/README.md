@@ -54,7 +54,8 @@ Sign up for [LangSmith](https://smith.langchain.com/) using your GitHub, Discord
 
 Then, create a unique API key on the [Settings Page](https://smith.langchain.com/settings), which is found in the menu at the top right corner of the page.
 
-Note: Save the API Key in a secure location. It will not be shown again.
+> [!NOTE]
+> Save the API Key in a secure location. It will not be shown again.
 
 ## 2. Log Traces
 
@@ -75,6 +76,7 @@ os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 # os.environ["LANGSMITH_ENDPOINT"] = "https://eu.api.smith.langchain.com" # If signed up in the EU region
 os.environ["LANGSMITH_API_KEY"] = "<YOUR-LANGSMITH-API-KEY>"
 # os.environ["LANGSMITH_PROJECT"] = "My Project Name" # Optional: "default" is used if not set
+# os.environ["LANGSMITH_WORKSPACE_ID"] = "<YOUR-WORKSPACE-ID>" # Required for org-scoped API keys
 ```
 
 > **Tip:** Projects are groups of traces. All runs are logged to a project. If not specified, the project is set to `default`.
@@ -428,3 +430,13 @@ See also official pytest docs: [How to install and use plugins](https://docs.pyt
 ## Additional Documentation
 
 To learn more about the LangSmith platform, check out the [docs](https://docs.smith.langchain.com/).
+
+
+# License
+
+The LangSmith SDK is licensed under the [MIT License](../LICENSE).
+
+The copyright information for certain dependencies' are reproduced in their corresponding COPYRIGHT.txt files in this repo, including the following:
+
+- [uuid-utils](docs/templates/uuid-utils/COPYRIGHT.txt)
+- [zstandard](docs/templates/zstandard/COPYRIGHT.txt)

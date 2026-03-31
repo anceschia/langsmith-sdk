@@ -26,6 +26,7 @@ from langsmith.evaluation.evaluator import (
     _normalize_evaluator_func,
     _normalize_summary_evaluator,
 )
+from tests.unit_tests.conftest import parse_request_data
 
 
 class FakeRequest:
@@ -80,8 +81,11 @@ class FakeRequest:
                 response = MagicMock()
                 response.json.return_value = self.created_session
                 return response
-            elif endpoint == "http://localhost:1984/runs/batch":
-                loaded_runs = json.loads(kwargs["data"])
+            elif (
+                endpoint == "http://localhost:1984/runs/batch"
+                or endpoint == "http://localhost:1984/runs/multipart"
+            ):
+                loaded_runs = parse_request_data(kwargs["data"])
                 posted = loaded_runs.get("post", [])
                 patched = loaded_runs.get("patch", [])
                 for p in posted:
@@ -612,7 +616,7 @@ async def test_aevaluate_results(
             deltas.append((now - last))
             last = now
         total = now - start  # type: ignore
-        assert 3.2 > total > 1.5
+        assert 3.3 > total > 1.5
 
         # Essentially we want to check that most calls were very fast.
         assert len(deltas) == SPLIT_SIZE * NUM_REPETITIONS

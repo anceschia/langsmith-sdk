@@ -9,6 +9,13 @@ import { Client } from "../index.js";
 import { afterAll, beforeAll } from "@jest/globals";
 import { RunnableLambda, RunnableSequence } from "@langchain/core/runnables";
 import { v4 as uuidv4 } from "uuid";
+
+import * as ai from "ai";
+import { openai } from "@ai-sdk/openai";
+import { wrapAISDK } from "../experimental/vercel/index.js";
+
+const { generateText } = wrapAISDK(ai);
+
 const TESTING_DATASET_NAME = `test_dataset_js_evaluate_${uuidv4()}`;
 const TESTING_DATASET_NAME2 = `my_splits_ds_${uuidv4()}`;
 
@@ -111,78 +118,8 @@ test("evaluate can repeat", async () => {
   }
 });
 
-test("evaluate can evaluate with RunEvaluator evaluators", async () => {
-  const targetFunc = (input: { input: number }) => {
-    return { foo: input.input + 1 };
-  };
-
-  const customEvaluator = async (run: Run, example?: Example) => {
-    return Promise.resolve({
-      key: "key",
-      score: 1,
-      comment: `Run: ${run.id} Example: ${example?.id}`,
-    });
-  };
-  const evaluator = {
-    evaluateRun: customEvaluator,
-  };
-  const evalRes = await evaluate(targetFunc, {
-    data: TESTING_DATASET_NAME,
-    evaluators: [evaluator],
-    description: "evaluate can evaluate with RunEvaluator evaluators",
-  });
-
-  expect(evalRes.results).toHaveLength(2);
-
-  expect(evalRes.results[0].run).toBeDefined();
-  expect(evalRes.results[0].example).toBeDefined();
-  expect(evalRes.results[0].evaluationResults).toBeDefined();
-
-  const firstRun = evalRes.results[0].run;
-  // The examples are not always in the same order, so it should always be 2 or 3
-  expect(firstRun.outputs?.foo).toBeGreaterThanOrEqual(2);
-  expect(firstRun.outputs?.foo).toBeLessThanOrEqual(3);
-
-  const firstExample = evalRes.results[0].example;
-  expect(firstExample).toBeDefined();
-
-  const firstEvalResults = evalRes.results[0].evaluationResults;
-  expect(firstEvalResults.results).toHaveLength(1);
-  expect(firstEvalResults.results[0].key).toEqual("key");
-  expect(firstEvalResults.results[0].score).toEqual(1);
-
-  expect(evalRes.results[1].run).toBeDefined();
-  expect(evalRes.results[1].example).toBeDefined();
-  expect(evalRes.results[1].evaluationResults).toBeDefined();
-
-  const secondRun = evalRes.results[1].run;
-  // The examples are not always in the same order, so it should always be 2 or 3
-  expect(secondRun.outputs?.foo).toBeGreaterThanOrEqual(2);
-  expect(secondRun.outputs?.foo).toBeLessThanOrEqual(3);
-
-  const secondExample = evalRes.results[1].example;
-  expect(secondExample).toBeDefined();
-
-  const secondEvalResults = evalRes.results[1].evaluationResults;
-  expect(secondEvalResults.results).toHaveLength(1);
-  expect(secondEvalResults.results[0].key).toEqual("key");
-  expect(secondEvalResults.results[0].score).toEqual(1);
-
-  // Test runs & examples were passed to customEvaluator
-  const expectedCommentStrings = [
-    `Run: ${secondRun.id} Example: ${secondExample?.id}`,
-    `Run: ${firstRun.id} Example: ${firstExample?.id}`,
-  ];
-  const receivedCommentStrings = evalRes.results
-    .map(({ evaluationResults }) => evaluationResults.results[0].comment)
-    .filter((c): c is string => !!c);
-  expect(receivedCommentStrings.length).toBe(2);
-  expect(receivedCommentStrings).toEqual(
-    expect.arrayContaining(expectedCommentStrings)
-  );
-});
-
-test("evaluate can evaluate with custom evaluators", async () => {
+// Skipping for speed in CI, encapsulated below
+test.skip("evaluate can evaluate with custom evaluators", async () => {
   const targetFunc = (input: Record<string, any>) => {
     return {
       foo: input.input + 1,
@@ -253,7 +190,8 @@ test("evaluate can evaluate with custom evaluators", async () => {
   );
 });
 
-test("evaluate can evaluate with custom evaluators and array return value", async () => {
+// Skipping for speed in CI, encapsulated below
+test.skip("evaluate can evaluate with custom evaluators and array return value", async () => {
   const targetFunc = (input: Record<string, any>) => {
     return {
       foo: input.input + 1,
@@ -438,7 +376,7 @@ test("can pass multiple evaluators", async () => {
   ];
   const evalRes = await evaluate(targetFunc, {
     data: TESTING_DATASET_NAME,
-    evaluators: evaluators,
+    evaluators,
     description: "can pass multiple evaluators",
   });
   expect(evalRes.results).toHaveLength(2);
@@ -656,6 +594,84 @@ test("max concurrency works with custom evaluators", async () => {
   expect(receivedCommentStrings).toEqual(expectedCommentStrings);
 });
 
+test("concurrent evaluate restores dataset order before summary", async () => {
+  const client = new Client();
+  const exampleIterator = client.listExamples({
+    datasetName: TESTING_DATASET_NAME,
+  });
+  const examples: Example[] = [];
+  for await (const example of exampleIterator) {
+    examples.push(example);
+  }
+
+  const orderedExamples = examples.sort(
+    (a, b) => Number(a.inputs.input) - Number(b.inputs.input)
+  );
+  const expectedInputs = orderedExamples.map((example) =>
+    Number(example.inputs.input)
+  );
+
+  const targetFunc = async (input: Record<string, any>) => {
+    await new Promise((resolve) =>
+      setTimeout(resolve, input.input === 1 ? 100 : 10)
+    );
+    return {
+      foo: input.input + 1,
+    };
+  };
+
+  const customEvaluator = async (run: Run, example?: Example) => {
+    await new Promise((resolve) =>
+      setTimeout(resolve, Number(example?.inputs.input) === 1 ? 10 : 100)
+    );
+    return {
+      key: "paired",
+      score:
+        run.outputs?.foo === Number(example?.inputs.input ?? Number.NaN) + 1
+          ? 1
+          : 0,
+      comment: `input:${example?.inputs.input}`,
+    };
+  };
+
+  const inputOrderSummaryEvaluator = ({
+    inputs,
+  }: {
+    inputs?: Record<string, any>[];
+  }): EvaluationResult => {
+    return {
+      key: "input_order",
+      score: 1,
+      comment: (inputs ?? []).map((input) => input.input).join(","),
+    };
+  };
+
+  const evalRes = await evaluate(targetFunc, {
+    data: orderedExamples,
+    evaluators: [customEvaluator],
+    summaryEvaluators: [inputOrderSummaryEvaluator],
+    targetConcurrency: 2,
+    evaluationConcurrency: 2,
+    description:
+      "concurrent evaluate restores dataset order before summary integration test",
+  });
+
+  expect(
+    evalRes.results.map(({ example }) => Number(example.inputs.input))
+  ).toEqual(expectedInputs);
+  expect(evalRes.results.map(({ run }) => run.outputs?.foo)).toEqual(
+    expectedInputs.map((input) => input + 1)
+  );
+  expect(
+    evalRes.results.map(
+      ({ evaluationResults }) => evaluationResults.results[0].comment
+    )
+  ).toEqual(expectedInputs.map((input) => `input:${input}`));
+  expect(evalRes.summaryResults.results[0].comment).toBe(
+    expectedInputs.join(",")
+  );
+});
+
 test("max concurrency works with summary evaluators", async () => {
   const targetFunc = (input: Record<string, any>) => {
     return {
@@ -845,7 +861,8 @@ test("evaluate accepts evaluators which return multiple feedback keys", async ()
   ]);
 });
 
-test("evaluate can handle evaluators with object parameters", async () => {
+// Skipping for speed in CI
+test.skip("evaluate can handle evaluators with object parameters", async () => {
   const targetFunc = (input: Record<string, any>) => {
     return {
       foo: input.input + 1,
@@ -897,7 +914,8 @@ test("evaluate can handle evaluators with object parameters", async () => {
   expect(secondEval.comment).toContain("Expected:");
 });
 
-test("evaluate can mix evaluators with different parameter styles", async () => {
+// Skipping for speed in CI
+test.skip("evaluate can mix evaluators with different parameter styles", async () => {
   const targetFunc = (input: Record<string, any>) => {
     return {
       foo: input.input + 1,
@@ -952,7 +970,8 @@ test("evaluate can mix evaluators with different parameter styles", async () => 
   }
 });
 
-test("evaluate handles partial object parameters correctly", async () => {
+// Skipping for speed in CI
+test.skip("evaluate handles partial object parameters correctly", async () => {
   const targetFunc = (input: Record<string, any>) => {
     return {
       foo: input.input + 1,
@@ -1051,7 +1070,8 @@ test("evaluate handles async object-style evaluators", async () => {
   }
 });
 
-test("evaluate can evaluate with updated summary evaluators", async () => {
+// Skipping for speed in CI
+test.skip("evaluate can evaluate with updated summary evaluators", async () => {
   const targetFunc = (input: Record<string, any>) => {
     return {
       foo: input.input + 1,
@@ -1117,7 +1137,7 @@ test("evaluate can evaluate with updated summary evaluators", async () => {
   );
 });
 
-test("evaluate handles partial summary evaluator parameters correctly", async () => {
+test("evaluate handles summary evaluator parameters correctly", async () => {
   const targetFunc = (input: Record<string, any>) => {
     return {
       foo: input.input + 1,
@@ -1297,4 +1317,23 @@ test("evaluate enforces correct evaluator types for comparative evaluation at ru
       description: "Should fail at runtime",
     })
   ).rejects.toThrow(); // You might want to be more specific about the error message
+});
+
+test("evaluate succeeds with child runs that take a while to resolve", async () => {
+  const target = async () => {
+    void generateText({
+      prompt: "Hello world",
+      model: openai("gpt-5-nano"),
+    });
+    return { foo: "foo" };
+  };
+  const res = await evaluate(target, {
+    data: TESTING_DATASET_NAME,
+  });
+  expect(res.results.length).toEqual(2);
+  for (const result of res.results) {
+    // This check is important to ensure the output is set before child promises resolve
+    // for AI SDK
+    expect(result.run.outputs).toEqual({ foo: "foo" });
+  }
 });

@@ -5,6 +5,7 @@
     "lib": [
       "ES2021",
       "ES2022.Object",
+      "ES2022.Array",
       "DOM"
     ],
     "module": "NodeNext",
@@ -37,20 +38,25 @@
       "src/run_trees.ts",
       "src/traceable.ts",
       "src/evaluation/index.ts",
-      "src/evaluation/langchain.ts",
       "src/schemas.ts",
       "src/langchain.ts",
       "src/jest/index.ts",
       "src/jest/reporter.ts",
-      "src/vercel.ts",
       "src/vitest/index.ts",
       "src/vitest/reporter.ts",
       "src/wrappers/index.ts",
       "src/anonymizer/index.ts",
+      "src/wrappers/anthropic.ts",
       "src/wrappers/openai.ts",
-      "src/wrappers/vercel.ts",
+      "src/wrappers/gemini.ts",
       "src/singletons/traceable.ts",
-      "src/utils/jestlike/index.ts"
+      "src/utils/jestlike/index.ts",
+      "src/experimental/otel/setup.ts",
+      "src/experimental/otel/exporter.ts",
+      "src/experimental/otel/processor.ts",
+      "src/experimental/vercel/index.ts",
+      "src/experimental/anthropic/index.ts",
+      "src/experimental/sandbox/index.ts"
     ]
   }
 }

@@ -34,12 +34,12 @@ import type {
   LangSmithJestlikeWrapperParams,
   LangSmithJestlikeDescribeWrapper,
   LangSmithJestlikeDescribeWrapperConfig,
+  LangSmithJestlikeTestFunction,
 } from "./types.js";
 import { getEnvironmentVariable, isJsDom } from "../env.js";
 import {
   STRIP_ANSI_REGEX,
   TEST_ID_DELIMITER,
-  DEFAULT_TEST_TIMEOUT,
   UUID5_NAMESPACE,
 } from "./constants.js";
 
@@ -95,7 +95,7 @@ export function logOutputs(output: Record<string, unknown>) {
   context.setLoggedOutput(output);
 }
 
-export function _objectHash(obj: KVMap, depth = 0): string {
+export function _objectHash(obj: KVMap | unknown[], depth = 0): string {
   // Prevent infinite recursion
   if (depth > 50) {
     throw new Error(
@@ -168,8 +168,12 @@ export function generateWrapperFromJestlikeMethods(
   function getExampleId(
     datasetId: string,
     inputs: Record<string, unknown>,
-    outputs?: Record<string, unknown>
+    outputs?: Record<string, unknown>,
+    providedId?: string
   ) {
+    if (providedId) {
+      return providedId;
+    }
     const identifier = JSON.stringify({
       datasetId,
       inputsHash: _objectHash(inputs),
@@ -184,7 +188,8 @@ export function generateWrapperFromJestlikeMethods(
     datasetId: string;
     inputs: Record<string, unknown>;
     outputs: Record<string, unknown>;
-    metadata: Record<string, unknown>;
+    metadata?: Record<string, unknown>;
+    split?: string | string[];
     createdAt: string;
   }) {
     const {
@@ -193,21 +198,34 @@ export function generateWrapperFromJestlikeMethods(
       inputs,
       outputs,
       metadata,
+      split,
       createdAt,
       datasetId,
     } = params;
     let example;
     try {
       example = await client.readExample(exampleId);
+      const normalizedSplit = split
+        ? typeof split === "string"
+          ? [split]
+          : split
+        : undefined;
+      const { dataset_split, ...restMetadata } = example.metadata ?? {};
       if (
         _objectHash(example.inputs) !== _objectHash(inputs) ||
         _objectHash(example.outputs ?? {}) !== _objectHash(outputs ?? {}) ||
-        example.dataset_id !== datasetId
+        example.dataset_id !== datasetId ||
+        (normalizedSplit !== undefined &&
+          _objectHash(dataset_split ?? []) !==
+            _objectHash(normalizedSplit ?? [])) ||
+        (metadata !== undefined &&
+          _objectHash(restMetadata ?? {}) !== _objectHash(metadata ?? {}))
       ) {
         await client.updateExample(exampleId, {
           inputs,
           outputs,
           metadata,
+          split,
           dataset_id: datasetId,
         });
       }
@@ -217,6 +235,7 @@ export function generateWrapperFromJestlikeMethods(
           exampleId,
           datasetId,
           createdAt: new Date(createdAt ?? new Date()),
+          split,
           metadata,
         });
       } else {
@@ -372,11 +391,22 @@ export function generateWrapperFromJestlikeMethods(
           let commit;
           let dirty;
           try {
-            branch = execSync("git rev-parse --abbrev-ref HEAD")
+            branch = execSync("git rev-parse --abbrev-ref HEAD", {
+              stdio: ["ignore", "pipe", "ignore"],
+            })
               .toString()
               .trim();
-            commit = execSync("git rev-parse HEAD").toString().trim();
-            dirty = execSync("git status --porcelain").toString().trim() !== "";
+            commit = execSync("git rev-parse HEAD", {
+              stdio: ["ignore", "pipe", "ignore"],
+            })
+              .toString()
+              .trim();
+            dirty =
+              execSync("git status --porcelain", {
+                stdio: ["ignore", "pipe", "ignore"],
+              })
+                .toString()
+                .trim() !== "";
           } catch {
             return;
           }
@@ -450,9 +480,7 @@ export function generateWrapperFromJestlikeMethods(
     >(
       name: string,
       lsParams: LangSmithJestlikeWrapperParams<I, O>,
-      testFn: (
-        data: { inputs: I; referenceOutputs?: O } & Record<string, any>
-      ) => unknown | Promise<unknown>,
+      testFn: LangSmithJestlikeTestFunction<I, O>,
       timeout?: number
     ) {
       // Due to https://github.com/jestjs/jest/issues/13653,
@@ -465,8 +493,12 @@ export function generateWrapperFromJestlikeMethods(
       ) {
         context.enableTestTracking = lsParams.config.enableTestTracking;
       }
-      const { config, inputs, referenceOutputs, ...rest } = lsParams;
-      const totalRuns = config?.iterations ?? 1;
+      const { id, config, inputs, split, metadata, ...rest } = lsParams;
+      let referenceOutputs: O | undefined = rest.referenceOutputs;
+      if (!referenceOutputs && "outputs" in rest) {
+        referenceOutputs = rest.outputs as O;
+      }
+      const totalRuns = config?.repetitions ?? 1;
       for (let i = 0; i < totalRuns; i += 1) {
         const testUuid = v4().replace(/-/g, "").slice(0, 13);
         // Jest will not group tests under the same "describe" group if you await the test and
@@ -553,6 +585,14 @@ export function generateWrapperFromJestlikeMethods(
                           ...rest,
                           inputs: testInput,
                           referenceOutputs: testOutput,
+                          testMetadata: {
+                            exampleId,
+                            experimentId: project?.id,
+                            datasetId: dataset?.id,
+                            testTrackingEnabled: trackingEnabled(testContext),
+                            repetition: i,
+                            split,
+                          },
                         }
                       )
                     );
@@ -592,6 +632,9 @@ export function generateWrapperFromJestlikeMethods(
                       strippedErrorMessage
                     );
                     (langsmithFriendlyError as any).rawJestError = rawError;
+                    if (testContext.testRootRunTree) {
+                      testContext.testRootRunTree.outputs = loggedOutput;
+                    }
                     throw langsmithFriendlyError;
                   }
                 }
@@ -618,7 +661,12 @@ export function generateWrapperFromJestlikeMethods(
                       )} while syncing to LangSmith. Please contact us for help.`
                   );
                 }
-                exampleId = getExampleId(dataset.id, inputs, referenceOutputs);
+                exampleId = getExampleId(
+                  dataset.id,
+                  inputs,
+                  referenceOutputs,
+                  id
+                );
 
                 // TODO: Create or update the example in the background
                 // Currently run end time has to be after example modified time
@@ -633,7 +681,8 @@ export function generateWrapperFromJestlikeMethods(
                       datasetId: dataset.id,
                       inputs,
                       outputs: referenceOutputs ?? {},
-                      metadata: {},
+                      metadata,
+                      split,
                       createdAt,
                     })
                   );
@@ -718,7 +767,7 @@ export function generateWrapperFromJestlikeMethods(
               );
             }
           },
-          timeout ?? DEFAULT_TEST_TIMEOUT
+          timeout
         );
       }
     };
@@ -726,7 +775,10 @@ export function generateWrapperFromJestlikeMethods(
 
   function createEachMethod(method: (...args: any[]) => void) {
     function eachMethod<I extends KVMap, O extends KVMap>(
-      table: ({ inputs: I; referenceOutputs?: O } & Record<string, any>)[],
+      table: ({ id?: string; inputs: I; referenceOutputs?: O } & Record<
+        string,
+        any
+      >)[],
       config?: LangSmithJestlikeWrapperConfig
     ) {
       const context = testWrapperAsyncLocalStorageInstance.getStore();
@@ -740,9 +792,7 @@ export function generateWrapperFromJestlikeMethods(
       }
       return function (
         name: string,
-        fn: (
-          params: { inputs: I; referenceOutputs?: O } & Record<string, any>
-        ) => unknown | Promise<unknown>,
+        fn: LangSmithJestlikeTestFunction<I, O>,
         timeout?: number
       ) {
         for (let i = 0; i < table.length; i += 1) {

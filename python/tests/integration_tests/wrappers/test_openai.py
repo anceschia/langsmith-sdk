@@ -23,14 +23,14 @@ def test_chat_sync_api(stream: bool):
     patched_client = wrap_openai(openai.Client(), tracing_extra={"client": client})
     messages = [{"role": "user", "content": "Say 'foo'"}]
     original = original_client.chat.completions.create(
-        messages=messages,  # noqa: [arg-type]
+        messages=messages,
         stream=stream,
         temperature=0,
         seed=42,
         model="gpt-3.5-turbo",
     )
     patched = patched_client.chat.completions.create(
-        messages=messages,  # noqa: [arg-type]
+        messages=messages,
         stream=stream,
         temperature=0,
         seed=42,
@@ -225,6 +225,18 @@ def _collect_requests(mock_session: mock.MagicMock, filename: str):
             json.dump(collected_requests, f, indent=2)
 
 
+LS_TEST_CLIENT_INFO = {
+    "batch_ingest_config": {
+        "use_multipart_endpoint": False,
+        "scale_up_qsize_trigger": 1000,
+        "scale_up_nthreads_limit": 16,
+        "scale_down_nempty_trigger": 4,
+        "size_limit": 100,
+        "size_limit_bytes": 20971520,
+    },
+}
+
+
 test_cases = [
     {
         "description": "stream",
@@ -256,7 +268,7 @@ test_cases = [
     {
         "description": "reasoning",
         "params": {
-            "model": "o1-mini",
+            "model": "o4-mini",
             "messages": [
                 {
                     "role": "user",
@@ -271,6 +283,17 @@ test_cases = [
         "expect_usage_metadata": True,
         "check_reasoning_tokens": True,
     },
+    # just test flex as priority can randomly downgrade
+    {
+        "description": "flex service tier",
+        "params": {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": "howdy"}],
+            "service_tier": "flex",
+        },
+        "expect_usage_metadata": True,
+        "check_service_tier": "flex",
+    },
 ]
 
 
@@ -281,7 +304,10 @@ def test_wrap_openai_chat_tokens(test_case):
 
     oai_client = openai.Client()
     mock_session = mock.MagicMock()
-    ls_client = langsmith.Client(session=mock_session)
+    ls_client = langsmith.Client(
+        session=mock_session,
+        info=LS_TEST_CLIENT_INFO,
+    )
     wrapped_oai_client = wrap_openai(oai_client, tracing_extra={"client": ls_client})
 
     collect = Collect()
@@ -289,7 +315,10 @@ def test_wrap_openai_chat_tokens(test_case):
     with langsmith.tracing_context(enabled=True):
         params: dict[str, Any] = test_case["params"].copy()
         params["langsmith_extra"] = {"on_end": collect}
-        res = wrapped_oai_client.chat.completions.create(**params)
+        try:
+            res = wrapped_oai_client.chat.completions.create(**params)
+        except openai.APIConnectionError as e:
+            pytest.skip("Openai is having some issues: " + str(e))
 
         if params.get("stream"):
             for chunk in res:
@@ -310,6 +339,12 @@ def test_wrap_openai_chat_tokens(test_case):
                     usage_metadata["output_token_details"]["reasoning"]
                     == oai_usage.completion_tokens_details.reasoning_tokens
                 )
+            if test_case.get("check_service_tier"):
+                service_tier = test_case["check_service_tier"]
+                assert service_tier in usage_metadata["input_token_details"]
+                assert service_tier in usage_metadata["output_token_details"]
+                assert usage_metadata["input_token_details"][service_tier] > 0
+                assert usage_metadata["output_token_details"][service_tier] > 0
         else:
             assert collect.run.outputs.get("usage_metadata") is None
             assert collect.run.outputs.get("usage") is None
@@ -330,7 +365,10 @@ async def test_wrap_openai_chat_async_tokens(test_case):
 
     oai_client = openai.AsyncClient()
     mock_session = mock.MagicMock()
-    ls_client = langsmith.Client(session=mock_session)
+    ls_client = langsmith.Client(
+        session=mock_session,
+        info=LS_TEST_CLIENT_INFO,
+    )
     wrapped_oai_client = wrap_openai(oai_client, tracing_extra={"client": ls_client})
 
     collect = Collect()
@@ -338,7 +376,10 @@ async def test_wrap_openai_chat_async_tokens(test_case):
     with langsmith.tracing_context(enabled=True):
         params: dict[str, Any] = test_case["params"].copy()
         params["langsmith_extra"] = {"on_end": collect}
-        res = await wrapped_oai_client.chat.completions.create(**params)
+        try:
+            res = await wrapped_oai_client.chat.completions.create(**params)
+        except openai.APIConnectionError:
+            pytest.skip("Openai is having some issues.")
 
         if params.get("stream"):
             oai_usage = None
@@ -360,6 +401,12 @@ async def test_wrap_openai_chat_async_tokens(test_case):
                     usage_metadata["output_token_details"]["reasoning"]
                     == oai_usage.completion_tokens_details.reasoning_tokens
                 )
+            if test_case.get("check_service_tier"):
+                service_tier = test_case["check_service_tier"]
+                assert service_tier in usage_metadata["input_token_details"]
+                assert service_tier in usage_metadata["output_token_details"]
+                assert usage_metadata["input_token_details"][service_tier] > 0
+                assert usage_metadata["output_token_details"][service_tier] > 0
         else:
             assert collect.run.outputs.get("usage_metadata") is None
             assert collect.run.outputs.get("usage") is None
@@ -377,20 +424,33 @@ def test_parse_sync_api():
     import openai  # noqa
 
     mock_session = mock.MagicMock()
-    ls_client = langsmith.Client(session=mock_session)
+    ls_client = langsmith.Client(
+        session=mock_session,
+        info=LS_TEST_CLIENT_INFO,
+    )
 
     original_client = openai.Client()
     patched_client = wrap_openai(openai.Client(), tracing_extra={"client": ls_client})
 
     messages = [{"role": "user", "content": "Say 'foo' then stop."}]
 
-    original = original_client.beta.chat.completions.parse(
+    # beta parse
+    original_beta = original_client.beta.chat.completions.parse(
         messages=messages, model="gpt-3.5-turbo", temperature=0, seed=42, max_tokens=3
     )
-    patched = patched_client.beta.chat.completions.parse(
+    patched_beta = patched_client.beta.chat.completions.parse(
+        messages=messages, model="gpt-3.5-turbo", temperature=0, seed=42, max_tokens=3
+    )
+    # chat parse
+    original = original_client.chat.completions.parse(
+        messages=messages, model="gpt-3.5-turbo", temperature=0, seed=42, max_tokens=3
+    )
+    patched = patched_client.chat.completions.parse(
         messages=messages, model="gpt-3.5-turbo", temperature=0, seed=42, max_tokens=3
     )
 
+    assert type(original_beta) is type(patched_beta)
+    assert original_beta.choices == patched_beta.choices
     assert type(original) is type(patched)
     assert original.choices == patched.choices
 
@@ -407,7 +467,10 @@ async def test_parse_async_api():
     import openai  # noqa
 
     mock_session = mock.MagicMock()
-    ls_client = langsmith.Client(session=mock_session)
+    ls_client = langsmith.Client(
+        session=mock_session,
+        info=LS_TEST_CLIENT_INFO,
+    )
 
     original_client = openai.AsyncClient()
     patched_client = wrap_openai(
@@ -416,15 +479,23 @@ async def test_parse_async_api():
 
     messages = [{"role": "user", "content": "Say 'foo' then stop."}]
 
-    original = await original_client.beta.chat.completions.parse(
+    original_beta = await original_client.beta.chat.completions.parse(
         messages=messages, model="gpt-3.5-turbo", temperature=0, seed=42, max_tokens=3
     )
-    patched = await patched_client.beta.chat.completions.parse(
+    patched_beta = await patched_client.beta.chat.completions.parse(
+        messages=messages, model="gpt-3.5-turbo", temperature=0, seed=42, max_tokens=3
+    )
+    original = await original_client.chat.completions.parse(
+        messages=messages, model="gpt-3.5-turbo", temperature=0, seed=42, max_tokens=3
+    )
+    patched = await patched_client.chat.completions.parse(
         messages=messages, model="gpt-3.5-turbo", temperature=0, seed=42, max_tokens=3
     )
 
-    assert type(original) is type(patched)
+    assert type(original_beta) is type(patched_beta)
+    assert original_beta.choices == patched_beta.choices
     assert original.choices == patched.choices
+    assert type(original) is type(patched)
 
     time.sleep(0.1)
     for call in mock_session.request.call_args_list:
@@ -441,7 +512,10 @@ def test_parse_tokens():
     from openai.types.chat import ChatCompletion
 
     mock_session = mock.MagicMock()
-    ls_client = langsmith.Client(session=mock_session)
+    ls_client = langsmith.Client(
+        session=mock_session,
+        info=LS_TEST_CLIENT_INFO,
+    )
     wrapped_oai_client = wrap_openai(
         openai.Client(), tracing_extra={"client": ls_client}
     )
@@ -476,7 +550,10 @@ def test_responses_sync_api():
     import openai  # noqa
 
     mock_session = mock.MagicMock()
-    ls_client = langsmith.Client(session=mock_session)
+    ls_client = langsmith.Client(
+        session=mock_session,
+        info=LS_TEST_CLIENT_INFO,
+    )
 
     original_client = openai.Client()
     patched_client = wrap_openai(openai.Client(), tracing_extra={"client": ls_client})
@@ -548,32 +625,6 @@ def test_responses_sync_api():
         == patched_parse.output[0].content[0].parsed
     )
 
-    # Test stream
-    with original_client.responses.stream(
-        input="Say 'foo' then stop.",
-        model="gpt-4o-mini",
-        temperature=0,
-        max_output_tokens=16,
-    ) as original_stream:
-        for _ in original_stream:
-            pass
-        original_full = original_stream.get_final_response()
-    with patched_client.responses.stream(
-        input="Say 'foo' then stop.",
-        model="gpt-4o-mini",
-        temperature=0,
-        max_output_tokens=16,
-    ) as patched_stream:
-        for _ in patched_stream:
-            pass
-        patched_full = patched_stream.get_final_response()
-    original_chunks = list(original_stream)
-    patched_chunks = list(patched_stream)
-    assert len(original_chunks) == len(patched_chunks)
-    for orig, patched in zip(original_chunks, patched_chunks):
-        assert orig.output_text == patched.output_text
-    assert original_full.output_text == patched_full.output_text
-
     time.sleep(0.1)
     for call in mock_session.request.call_args_list:
         assert call[0][0].upper() in ["POST", "GET", "PATCH"]
@@ -587,7 +638,10 @@ async def test_responses_async_api():
     import openai  # noqa
 
     mock_session = mock.MagicMock()
-    ls_client = langsmith.Client(session=mock_session)
+    ls_client = langsmith.Client(
+        session=mock_session,
+        info=LS_TEST_CLIENT_INFO,
+    )
 
     original_client = openai.AsyncClient()
     patched_client = wrap_openai(
@@ -646,14 +700,14 @@ async def test_responses_async_api():
         input="Say 'foo' then stop.",
         model="gpt-4o-mini",
         temperature=0,
-        max_output_tokens=32,
+        max_output_tokens=1024,
         text_format=Format,
     )
     patched_parse = await patched_client.responses.parse(
         input="Say 'foo' then stop.",
         model="gpt-4o-mini",
         temperature=0,
-        max_output_tokens=32,
+        max_output_tokens=1024,
         text_format=Format,
     )
 
@@ -664,37 +718,97 @@ async def test_responses_async_api():
         == patched_parse.output[0].content[0].parsed
     )
 
-    # Test stream
-    original_chunks = []
-    patched_chunks = []
-    async with original_client.responses.stream(
-        model="gpt-4o-mini",
-        input=[{"role": "user", "content": "Say 'foo' then stop."}],
-        temperature=0,
-        max_output_tokens=16,
-    ) as original_stream:
-        async for chunk in original_stream:
-            original_chunks.append(chunk)
-        original_full = await original_stream.get_final_response()
-    async with patched_client.responses.stream(
-        model="gpt-4o-mini",
-        input=[{"role": "user", "content": "Say 'foo' then stop."}],
-        temperature=0,
-        max_output_tokens=16,
-    ) as patched_stream:
-        async for chunk in patched_stream:
-            patched_chunks.append(chunk)
-        patched_full = await patched_stream.get_final_response()
-    assert len(original_chunks) == len(patched_chunks)
-    for orig, patched in zip(original_chunks, patched_chunks):
-        assert orig.type == patched.type
-    assert original_full.output_text == patched_full.output_text
-
     time.sleep(0.1)
     for call in mock_session.request.call_args_list:
         assert call[0][0].upper() in ["POST", "GET", "PATCH"]
 
     _collect_requests(mock_session, "test_responses_sync_api")
+
+
+def test_responses_stream_sync_api():
+    """Test that the sync responses methods can be traced without errors."""
+    import openai  # noqa
+
+    mock_session = mock.MagicMock()
+    ls_client = langsmith.Client(
+        session=mock_session,
+        info=LS_TEST_CLIENT_INFO,
+    )
+    original_client = openai.Client()
+    patched_client = wrap_openai(openai.Client(), tracing_extra={"client": ls_client})
+
+    # Test stream
+    with original_client.responses.stream(
+        input="Say 'foo' then stop.",
+        model="gpt-5-nano",
+        max_output_tokens=1024,
+    ) as original_stream:
+        for _ in original_stream:
+            pass
+        original_full = original_stream.get_final_response()
+    with patched_client.responses.stream(
+        input="Say 'foo' then stop.",
+        model="gpt-5-nano",
+        max_output_tokens=1024,
+    ) as patched_stream:
+        for _ in patched_stream:
+            pass
+        patched_full = patched_stream.get_final_response()
+    original_chunks = list(original_stream)
+    patched_chunks = list(patched_stream)
+    assert len(original_chunks) == len(patched_chunks)
+    for orig, patched in zip(original_chunks, patched_chunks):
+        assert orig.output_text == patched.output_text
+    assert original_full.output_text == patched_full.output_text
+
+    time.sleep(0.5)
+    for call in mock_session.request.call_args_list:
+        assert call[0][0].upper() in ["POST", "GET", "PATCH"]
+
+    _collect_requests(mock_session, "test_responses_stream_sync_api")
+
+
+async def test_responses_stream_async_api():
+    """Test that the async responses methods can be traced without errors."""
+    import openai  # noqa
+
+    mock_session = mock.MagicMock()
+    ls_client = langsmith.Client(
+        session=mock_session,
+        info=LS_TEST_CLIENT_INFO,
+    )
+    original_client = openai.AsyncClient()
+    patched_client = wrap_openai(
+        openai.AsyncClient(), tracing_extra={"client": ls_client}
+    )
+    original_chunks = []
+    patched_chunks = []
+    async with original_client.responses.stream(
+        input="Say 'foo' then stop.",
+        model="gpt-5-nano",
+        max_output_tokens=1024,
+    ) as original_stream:
+        async for chunk in original_stream:
+            original_chunks.append(chunk)
+            pass
+        original_full = await original_stream.get_final_response()
+    async with patched_client.responses.stream(
+        input="Say 'foo' then stop.",
+        model="gpt-5-nano",
+        max_output_tokens=1024,
+    ) as patched_stream:
+        async for chunk in patched_stream:
+            patched_chunks.append(chunk)
+            pass
+        patched_full = await patched_stream.get_final_response()
+    assert len(original_chunks) == len(patched_chunks)
+    assert original_full.output_text == patched_full.output_text
+
+    time.sleep(0.5)
+    for call in mock_session.request.call_args_list:
+        assert call[0][0].upper() in ["POST", "GET", "PATCH"]
+
+    _collect_requests(mock_session, "test_responses_stream_async_api")
 
 
 @pytest.mark.asyncio
@@ -704,7 +818,10 @@ async def test_tool_call_chunking():
     from openai.types.chat import ChatCompletionChunk
 
     mock_session = mock.MagicMock()
-    ls_client = langsmith.Client(session=mock_session)
+    ls_client = langsmith.Client(
+        session=mock_session,
+        info=LS_TEST_CLIENT_INFO,
+    )
 
     client = wrap_openai(openai.AsyncClient(), tracing_extra={"client": ls_client})
 
@@ -774,3 +891,58 @@ async def test_tool_call_chunking():
     time.sleep(0.1)
     for call in mock_session.request.call_args_list:
         assert call[0][0].upper() in ["POST", "GET", "PATCH"]
+
+
+def test_prepopulated_invocation_params():
+    """Test that prepopulated invocation params are merged
+    and runtime params override."""
+    import openai
+
+    mock_session = mock.MagicMock()
+    client = langsmith.Client(
+        session=mock_session,
+        info=LS_TEST_CLIENT_INFO,
+    )
+
+    # Wrap client with prepopulated params including seed
+    patched_client = wrap_openai(
+        openai.Client(),
+        tracing_extra={
+            "client": client,
+            "metadata": {
+                "ls_invocation_params": {"seed": 100, "test": "qa"},
+                "custom_key": "custom_value",
+                "version": "1.0.0",
+            },
+        },
+    )
+
+    collect = Collect()
+    messages = [{"role": "user", "content": "Say 'hello'"}]
+
+    with langsmith.tracing_context(enabled=True):
+        patched_client.chat.completions.create(
+            messages=messages,
+            seed=42,  # Should override prepopulated seed=100
+            model="gpt-5-nano",
+            langsmith_extra={"on_end": collect},
+        )
+
+    # Give the thread a chance
+    time.sleep(0.1)
+
+    # Check the run data from the callback
+    assert collect.run is not None
+
+    # Check invocation params - they are in metadata, not extra.invocation_params
+    metadata = collect.run.extra.get("metadata", {})
+    ls_invocation_params = metadata.get("ls_invocation_params", {})
+
+    # Runtime seed should override prepopulated seed
+    assert ls_invocation_params.get("seed") == 42
+    # Prepopulated params without conflicts should still be there
+    assert ls_invocation_params.get("test") == "qa"
+
+    # Check that other metadata keys are preserved
+    assert metadata.get("custom_key") == "custom_value"
+    assert metadata.get("version") == "1.0.0"

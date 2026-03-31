@@ -1,3 +1,21 @@
+/**
+ * Get the error message for an invalid prompt identifier.
+ * Used consistently across the codebase when parsing prompt identifiers fails.
+ *
+ * @param identifier - The invalid identifier that was provided
+ * @returns A formatted error message explaining the valid formats
+ */
+export function getInvalidPromptIdentifierMsg(identifier: string): string {
+  return (
+    `Invalid prompt identifier format: "${identifier}". ` +
+    `Expected one of:\n` +
+    `  - "prompt-name" (for private prompts)\n` +
+    `  - "owner/prompt-name" (for prompts with explicit owner)\n` +
+    `  - "prompt-name:commit-hash" (with commit reference)\n` +
+    `  - "owner/prompt-name:commit-hash" (with owner and commit)`
+  );
+}
+
 function getErrorStackTrace(e: unknown) {
   if (typeof e !== "object" || e == null) return undefined;
   if (!("stack" in e) || typeof e.stack !== "string") return undefined;
@@ -64,6 +82,35 @@ export class LangSmithConflictError extends Error {
 }
 
 /**
+ * LangSmithNotFoundError
+ *
+ * Represents an error that occurs when a requested resource is not found,
+ * typically corresponding to HTTP 404 status code responses.
+ *
+ * @extends Error
+ */
+export class LangSmithNotFoundError extends Error {
+  status: number;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "LangSmithNotFoundError";
+    this.status = 404;
+  }
+}
+
+export function isLangSmithNotFoundError(
+  error: unknown
+): error is LangSmithNotFoundError {
+  return (
+    error != null &&
+    typeof error === "object" &&
+    "name" in error &&
+    error?.name === "LangSmithNotFoundError"
+  );
+}
+
+/**
  * Throws an appropriate error based on the response status and body.
  *
  * @param response - The fetch Response object
@@ -74,25 +121,80 @@ export class LangSmithConflictError extends Error {
 export async function raiseForStatus(
   response: Response,
   context: string,
-  consume?: boolean
+  consumeOnSuccess?: boolean
 ): Promise<void> {
-  // consume the response body to release the connection
-  // https://undici.nodejs.org/#/?id=garbage-collection
   let errorBody;
   if (response.ok) {
-    if (consume) {
+    // consume the response body to release the connection
+    // https://undici.nodejs.org/#/?id=garbage-collection
+    if (consumeOnSuccess) {
       errorBody = await response.text();
     }
     return;
   }
-  errorBody = await response.text();
-  const fullMessage = `Failed to ${context}. Received status [${response.status}]: ${response.statusText}. Server response: ${errorBody}`;
+
+  if (response.status === 403) {
+    try {
+      const errorData = await response.json();
+      const errorCode = errorData?.error;
+      if (errorCode === "org_scoped_key_requires_workspace") {
+        errorBody =
+          "This API key is org-scoped and requires workspace specification. " +
+          "Please provide 'workspaceId' parameter, " +
+          "or set LANGSMITH_WORKSPACE_ID environment variable.";
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (e: any) {
+      const errorWithStatus = new Error(
+        `${response.status} ${response.statusText}`
+      );
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (errorWithStatus as any).status = response?.status;
+      throw errorWithStatus;
+    }
+  }
+  if (errorBody === undefined) {
+    try {
+      errorBody = await response.text();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (e: any) {
+      errorBody = "";
+    }
+  }
+
+  const fullMessage = `Failed to ${context}. Received status [${response.status}]: ${response.statusText}. Message: ${errorBody}`;
+
+  if (response.status === 404) {
+    throw new LangSmithNotFoundError(fullMessage);
+  }
 
   if (response.status === 409) {
     throw new LangSmithConflictError(fullMessage);
   }
 
   const err = new Error(fullMessage);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (err as any).status = response.status;
   throw err;
+}
+
+const ERR_CONFLICTING_ENDPOINTS = "ERR_CONFLICTING_ENDPOINTS";
+export class ConflictingEndpointsError extends Error {
+  readonly code = ERR_CONFLICTING_ENDPOINTS;
+  constructor() {
+    super(
+      "You cannot provide both LANGSMITH_ENDPOINT / LANGCHAIN_ENDPOINT " +
+        "and LANGSMITH_RUNS_ENDPOINTS."
+    );
+    this.name = "ConflictingEndpointsError"; // helpful in logs
+  }
+}
+export function isConflictingEndpointsError(
+  err: unknown
+): err is ConflictingEndpointsError {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as Record<string, unknown>).code === ERR_CONFLICTING_ENDPOINTS
+  );
 }

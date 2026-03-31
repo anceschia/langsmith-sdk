@@ -10,6 +10,7 @@ export type {
   TracerSession,
   Run,
   Feedback,
+  FeedbackConfigSchema,
   RetrieverOutput,
 } from "./schemas.js";
 
@@ -17,5 +18,18 @@ export { RunTree, type RunTreeConfig } from "./run_trees.js";
 
 export { overrideFetchImplementation } from "./singletons/fetch.js";
 
-// Update using yarn bump-version
-export const __version__ = "0.3.30";
+export { getDefaultProjectName } from "./utils/project.js";
+
+export { uuid7, uuid7FromTime } from "./uuid.js";
+
+export {
+  Cache,
+  PromptCache,
+  type CacheConfig,
+  type CacheMetrics,
+  configureGlobalPromptCache,
+  promptCacheSingleton,
+} from "./utils/prompt_cache/index.js";
+
+// Update using pnpm bump-version
+export const __version__ = "0.5.15";

@@ -1,6 +1,16 @@
 import { Run } from "../../schemas.js";
+import { Client } from "../../client.js";
 
-export function getAssumedTreeFromCalls(calls: unknown[][]) {
+export async function getAssumedTreeFromCalls(
+  calls: unknown[][],
+  client: Client
+): Promise<{
+  nodes: string[];
+  edges: Array<[string, string]>;
+  data: Record<string, Run>;
+}> {
+  await client.awaitPendingTraceBatches();
+
   const edges: Array<[string, string]> = [];
 
   const nodeMap: Record<string, Run> = {};
@@ -35,13 +45,12 @@ export function getAssumedTreeFromCalls(calls: unknown[][]) {
       body = JSON.parse(fetchArgs.body);
     } else {
       const decoded = new TextDecoder().decode(fetchArgs.body);
-
       if (decoded.trim().startsWith("{")) {
         body = JSON.parse(decoded);
       }
     }
 
-    if (req === "POST /runs") {
+    if (req === "POST /runs" || req === "POST /api/v1/runs") {
       const id = body!.id;
       upsertId(id);
       nodeMap[id] = { ...nodeMap[id], ...body! };
@@ -49,8 +58,15 @@ export function getAssumedTreeFromCalls(calls: unknown[][]) {
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
         edges.push([nodeMap[id].parent_run_id!, nodeMap[id].id]);
       }
-    } else if (req.startsWith("PATCH /runs/")) {
-      const id = req.substring("PATCH /runs/".length);
+    } else if (
+      req.startsWith("PATCH /runs/") ||
+      req.startsWith("PATCH /api/v1/runs/")
+    ) {
+      const id = req.substring(
+        req.startsWith("PATCH /api/v1/runs/")
+          ? "PATCH /api/v1/runs/".length
+          : "PATCH /runs/".length
+      );
       upsertId(id);
       nodeMap[id] = { ...nodeMap[id], ...body! };
     }

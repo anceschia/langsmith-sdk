@@ -14,6 +14,9 @@ on:
         default: false
         description: "Release from a non-main branch (danger!)"
 
+permissions:
+  id-token: write  # Required for OIDC
+  contents: read
 
 jobs:
   if_release:
@@ -27,24 +30,29 @@ jobs:
       run:
         working-directory: "js"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # JS Build
-      - name: Use Node.js 20.x
-        uses: actions/setup-node@v3
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
         with:
-          node-version: 20.x
-          cache: "yarn"
-          cache-dependency-path: "js/yarn.lock"
+          version: 10
+      - name: Use Node.js 24.x
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          cache: pnpm
+          cache-dependency-path: js/pnpm-lock.yaml
+          registry-url: "https://registry.npmjs.org"
       - name: Install dependencies
-        run: yarn install --immutable
+        run: pnpm install --frozen-lockfile
       - name: Build
-        run: yarn run build
+        run: pnpm run build
       - name: Check version
-        run: yarn run check-version
+        run: pnpm run check-version
       - name: Check NPM version
         id: check_npm_version
         run: |
-          if yarn run check-npm-version; then
+          if pnpm run check-npm-version; then
             echo "should_publish=true" >> $GITHUB_OUTPUT
           else
             echo "should_publish=false" >> $GITHUB_OUTPUT
@@ -52,5 +60,4 @@ jobs:
       - name: Publish package to NPM
         if: steps.check_npm_version.outputs.should_publish == 'true'
         run: |
-          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > .npmrc
-          yarn publish --non-interactive
+          npm publish
